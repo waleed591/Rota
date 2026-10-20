@@ -4,6 +4,58 @@ import psycopg2
 from datetime import datetime, timedelta, time
 import os
 
+# ==========================================
+# 1. AUTHENTICATION CHECK
+# ==========================================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.set_page_config(page_title="Login", page_icon="🔒", layout="centered")
+    st.title("🔒 Rota Tracker Login")
+    st.markdown("Please enter your credentials to access the app.")
+    
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+        
+        if submitted:
+            # These are checked against your secure Streamlit Secrets
+            valid_user = st.secrets.get("APP_USERNAME", "admin")
+            valid_pass = st.secrets.get("APP_PASSWORD", "password")
+            
+            if username == valid_user and password == valid_pass:
+                st.session_state.authenticated = True
+                st.success("Login successful! Redirecting...")
+                st.rerun()
+            else:
+                st.error("❌ Invalid username or password.")
+    
+    st.stop() # Stops the app from loading the rest of the code until logged in
+
+# ==========================================
+# 2. MAIN APP (Only runs if authenticated)
+# ==========================================
+st.set_page_config(page_title="Rota Earnings Tracker", page_icon="💷", layout="wide")
+st.title("💷 Rota & Earnings Tracker")
+
+# Add Logout button to the top of the sidebar
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.authenticated = False
+    st.rerun()
+
+# Hide Streamlit menu for app-like feel
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .stAppDeployButton {display: none;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
 # --- DATABASE SETUP ---
 DATABASE_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL"))
 
@@ -80,21 +132,6 @@ def load_gogo_transactions():
     except Exception as e:
         st.error(f"Error loading transactions: {e}")
         return pd.DataFrame()
-
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="Rota Earnings Tracker", page_icon="💷", layout="wide")
-st.title("💷 Rota & Earnings Tracker")
-
-# Hide Streamlit menu for app-like feel
-hide_streamlit_style = """
-    <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .stAppDeployButton {display: none;}
-    </style>
-"""
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 page = st.sidebar.radio("Navigation", ["➕ Enter Rota", "📊 View History & Earnings", "🏠 GOGO Ledger"])
 
@@ -298,7 +335,7 @@ elif page == "📊 View History & Earnings":
                 st.rerun()
 
 # ==========================================
-# PAGE 3: GOGO LEDGER (UPDATED)
+# PAGE 3: GOGO LEDGER
 # ==========================================
 elif page == "🏠 GOGO Ledger":
     st.header("🏠 GOGO Rent & Payments Ledger")
@@ -308,14 +345,12 @@ elif page == "🏠 GOGO Ledger":
         with col_s1:
             st.session_state.gogo_monthly_rent = st.number_input(
                 "Monthly Rent Amount (£)", min_value=0.0, 
-                value=st.session_state.gogo_monthly_rent, step=10.0, format="%.2f",
-                help="Your fixed monthly rent deducted by the owner."
+                value=st.session_state.gogo_monthly_rent, step=10.0, format="%.2f"
             )
         with col_s2:
             st.session_state.gogo_starting_balance = st.number_input(
                 "Starting Balance (£)", min_value=-10000.0, 
-                value=st.session_state.gogo_starting_balance, step=10.0, format="%.2f",
-                help="Amount the owner owed you BEFORE the first recorded transaction."
+                value=st.session_state.gogo_starting_balance, step=10.0, format="%.2f"
             )
     
     st.markdown("---")
@@ -365,7 +400,7 @@ elif page == "🏠 GOGO Ledger":
                 'Date': row['shift_date'], 
                 'Description': f"Shift ({row['start_time']} - {row['end_time']})",
                 'Type': 'Wages Earned', 
-                'Amount': row['hourly_earning'], # UPDATED: Now uses only base hourly earnings
+                'Amount': row['hourly_earning'],
                 'Month': row['shift_date'].to_period('M')
             })
     if not gogo_trans.empty:
@@ -380,7 +415,6 @@ elif page == "🏠 GOGO Ledger":
                 'Month': row['trans_date'].to_period('M')
             })
     
-    # UPDATED: Summary calculations now use hourly_earning instead of gross_earning
     total_wages = gogo_shifts['hourly_earning'].sum() if not gogo_shifts.empty else 0.0
     total_payments = gogo_trans[gogo_trans['trans_type'] == 'PAYMENT']['amount'].sum() if not gogo_trans.empty else 0.0
     total_rent_deducted = gogo_trans[gogo_trans['trans_type'] == 'RENT']['amount'].sum() if not gogo_trans.empty else 0.0
