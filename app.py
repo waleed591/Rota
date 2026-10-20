@@ -298,7 +298,7 @@ elif page == "📊 View History & Earnings":
                 st.rerun()
 
 # ==========================================
-# PAGE 3: GOGO LEDGER
+# PAGE 3: GOGO LEDGER (UPDATED)
 # ==========================================
 elif page == "🏠 GOGO Ledger":
     st.header("🏠 GOGO Rent & Payments Ledger")
@@ -365,7 +365,7 @@ elif page == "🏠 GOGO Ledger":
                 'Date': row['shift_date'], 
                 'Description': f"Shift ({row['start_time']} - {row['end_time']})",
                 'Type': 'Wages Earned', 
-                'Amount': row['gross_earning'],
+                'Amount': row['hourly_earning'], # UPDATED: Now uses only base hourly earnings
                 'Month': row['shift_date'].to_period('M')
             })
     if not gogo_trans.empty:
@@ -380,7 +380,8 @@ elif page == "🏠 GOGO Ledger":
                 'Month': row['trans_date'].to_period('M')
             })
     
-    total_wages = gogo_shifts['gross_earning'].sum() if not gogo_shifts.empty else 0.0
+    # UPDATED: Summary calculations now use hourly_earning instead of gross_earning
+    total_wages = gogo_shifts['hourly_earning'].sum() if not gogo_shifts.empty else 0.0
     total_payments = gogo_trans[gogo_trans['trans_type'] == 'PAYMENT']['amount'].sum() if not gogo_trans.empty else 0.0
     total_rent_deducted = gogo_trans[gogo_trans['trans_type'] == 'RENT']['amount'].sum() if not gogo_trans.empty else 0.0
     
@@ -388,7 +389,7 @@ elif page == "🏠 GOGO Ledger":
     
     st.subheader("Summary for Selected Period")
     m1, m2, m3 = st.columns(3)
-    m1.metric("Wages Earned", f"£{total_wages:.2f}")
+    m1.metric("Base Wages Earned", f"£{total_wages:.2f}")
     m2.metric("Rent Deducted", f"£{total_rent_deducted:.2f}")
     m3.metric("Payments Received", f"£{total_payments:.2f}")
     
