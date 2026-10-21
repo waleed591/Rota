@@ -657,7 +657,7 @@ if page == PAGES[0]:
                         if (nd, r.employer, r.start_time, r.end_time) in existing:
                             continue
                         insert_shift(nd, r.employer, r.start_time, r.end_time, r.hourly_rate, r.hours_worked,
-                                     r.hourly_earning, 0, 0, 0, 0, r.hourly_earning, 0, r.employer == "GOGO")
+                                     r.hourly_earning, 0, 0, 0, 0, r.hourly_earning, 0, False)
                         n += 1
                     ss.flash = ("success" if n else "info", f"Copied {n} shift(s)." if n else "Nothing new to copy.")
                     st.rerun()
@@ -687,11 +687,8 @@ if page == PAGES[0]:
         fuel_cost = d1.number_input("Fuel Cost (£) −", min_value=0.0, value=0.0, step=1.0, format="%.2f")
         expense_cost = d2.number_input("Other Expenses (£) −", min_value=0.0, value=0.0, step=1.0, format="%.2f")
         miles = d3.number_input("Miles driven", min_value=0.0, value=0.0, step=1.0, format="%.1f")
-        if employer == "GOGO":
-            is_paid = True
-            st.caption("GOGO wages are settled through the GOGO Ledger.")
-        else:
-            is_paid = st.checkbox("✅ Already paid by employer", value=False)
+        is_paid = st.checkbox("✅ Shift already paid", value=False, key="paid_in",
+                              help="Leave unticked if you are still waiting to be paid for this shift.")
 
     hours = calculate_hours(start_time, end_time)
     hourly_e, mileage_e, gross_e, warn = compute_shift(employer, hours, hourly_rate, paid_chinese, mileage_in, tips)
@@ -781,16 +778,45 @@ elif page == PAGES[1]:
     st.markdown("---")
     tab_log, tab_week, tab_emp = st.tabs(["📋 Shift log", "📈 Weekly trend", "🏢 By employer"])
     with tab_log:
+        ss.setdefault("log_ver", 0)
+        sel_all = st.checkbox("Select all shifts shown", key="log_sel_all")
+        log = fdf[["id", "shift_date", "employer", "start_time", "end_time", "hours_worked", "hourly_earning",
+                   "mileage_earning", "tips", "fuel_cost", "expense_cost", "miles", "paid", "final"]].copy()
+        log["status"] = log["paid"].map({True: "✅ Paid", False: "⏳ Unpaid"})
+        log = log.drop(columns=["paid"])
+        log.insert(0, "Select", bool(sel_all))
         mny = lambda t: st.column_config.NumberColumn(t, format="%.2f")
-        log = fdf[["shift_date", "employer", "start_time", "end_time", "hours_worked", "hourly_earning",
-                   "mileage_earning", "tips", "fuel_cost", "expense_cost", "miles", "paid", "final"]]
-        show_table(log, {
-            "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"), "employer": "Location",
-            "start_time": "Start", "end_time": "End", "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
-            "hourly_earning": mny("Hourly (£)"), "mileage_earning": mny("Mileage (£)"), "tips": mny("Tips (£)"),
-            "fuel_cost": mny("Fuel (−£)"), "expense_cost": mny("Expense (−£)"),
-            "miles": st.column_config.NumberColumn("Miles", format="%.1f"),
-            "paid": st.column_config.CheckboxColumn("Paid"), "final": mny("Net (£)" if show_net else "Gross (£)")})
+        edited = st.data_editor(
+            log, hide_index=True, key=f"log_editor_{ss.log_ver}_{int(sel_all)}",
+            disabled=[c for c in log.columns if c != "Select"],
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select"), "id": None,
+                "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"), "employer": "Location",
+                "start_time": "Start", "end_time": "End",
+                "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
+                "hourly_earning": mny("Hourly (£)"), "mileage_earning": mny("Mileage (£)"), "tips": mny("Tips (£)"),
+                "fuel_cost": mny("Fuel (−£)"), "expense_cost": mny("Expense (−£)"),
+                "miles": st.column_config.NumberColumn("Miles", format="%.1f"),
+                "status": "Status", "final": mny("Net (£)" if show_net else "Gross (£)")})
+        picked = edited.loc[edited["Select"], "id"].astype(int).tolist()
+        st.caption(f"{len(picked)} shift(s) selected — tick the **Select** boxes, then choose an action:")
+        b1, b2, _sp = st.columns([1, 1, 2])
+        if b1.button("✅ Mark selected as paid", type="primary"):
+            if picked:
+                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s)", (picked,))
+                ss.log_ver += 1
+                ss.flash = ("success", f"Marked {len(picked)} shift(s) as paid.")
+                st.rerun()
+            else:
+                st.warning("Tick at least one shift first.")
+        if b2.button("⏳ Mark selected as unpaid"):
+            if picked:
+                run("UPDATE shifts SET paid = FALSE WHERE id = ANY(%s)", (picked,))
+                ss.log_ver += 1
+                ss.flash = ("success", f"Marked {len(picked)} shift(s) as unpaid.")
+                st.rerun()
+            else:
+                st.warning("Tick at least one shift first.")
     with tab_week:
         st.caption("Earnings per week (weeks start on Monday)")
         st.bar_chart(fdf.groupby("week_start")["final"].sum().sort_index(), color="#6366f1")
@@ -804,7 +830,7 @@ elif page == PAGES[1]:
     with st.expander("✏️ Edit a shift"):
         esel = st.selectbox("Select shift to edit", list(labels), format_func=labels.get, key="edit_sel")
         r = fdf[fdf["id"] == esel].iloc[0]
-        kk = f"e{esel}_"
+        kk = f"e{esel}_{int(bool(r['paid']))}_"
         with st.form("edit_shift_form"):
             c1, c2 = st.columns(2)
             e_emp = c1.selectbox("Employer", EMPLOYERS, index=EMPLOYERS.index(r["employer"]) if r["employer"] in EMPLOYERS else 0, key=kk + "emp")
@@ -830,7 +856,7 @@ elif page == PAGES[1]:
                            expense_cost=%s, gross_earning=%s, miles=%s, paid=%s WHERE id=%s""",
                         (e_date, e_emp, e_st.strftime("%H:%M"), e_en.strftime("%H:%M"), e_rate, round(hrs, 2),
                          round(hE, 2), round(mE, 2), round(e_tips, 2), round(e_fuel, 2), round(e_exp, 2),
-                         round(gE, 2), round(e_miles, 1), bool(e_paid or e_emp == "GOGO"), int(esel)))
+                         round(gE, 2), round(e_miles, 1), bool(e_paid), int(esel)))
                     ss.flash = ("success", "Shift updated.")
                     st.rerun()
 
@@ -846,13 +872,15 @@ elif page == PAGES[1]:
             e1.caption("Excel export needs `openpyxl` in requirements.txt.")
         e2.download_button("📄 Download CSV", export_df.to_csv(index=False).encode(), f"shifts_{TODAY:%Y%m%d}.csv", "text/csv")
 
+    def delete_shift():
+        run("DELETE FROM shifts WHERE id = %s", (int(ss.del_sel),))
+        ss.confirm_del_shift = False  # allowed here: callbacks run before widgets are drawn
+        ss.flash = ("success", "Shift deleted.")
+
     with st.expander("⚠️ Delete a shift"):
-        dsel = st.selectbox("Select shift to delete", list(labels), format_func=labels.get, key="del_sel")
+        st.selectbox("Select shift to delete", list(labels), format_func=labels.get, key="del_sel")
         sure = st.checkbox("Yes, delete this shift permanently", key="confirm_del_shift")
-        if st.button("Delete selected shift", disabled=not sure):
-            run("DELETE FROM shifts WHERE id = %s", (int(dsel),))
-            ss.confirm_del_shift = False
-            st.rerun()
+        st.button("Delete selected shift", disabled=not sure, on_click=delete_shift)
 
 # ==========================================================
 # PAGE: GOGO LEDGER
@@ -1024,17 +1052,19 @@ elif page == PAGES[2]:
                     ss.flash = ("success", "Transaction updated.")
                     st.rerun()
 
+    def delete_tx():
+        run("DELETE FROM gogo_transactions WHERE id = %s", (int(ss.tx_del_sel),))
+        ss.confirm_del_tx = False
+        ss.flash = ("success", "Transaction deleted.")
+
     with st.expander("⚠️ Delete a transaction"):
         if trans_all.empty:
             st.info("No transactions recorded yet.")
         else:
             dl = {int(r.id): f"{r.trans_date:%d %b %Y} · {r.trans_type} · {gbp(r.amount)}" for r in trans_all.sort_values("trans_date", ascending=False).itertuples()}
-            dsel = st.selectbox("Select transaction to delete", list(dl), format_func=dl.get, key="tx_del_sel")
+            st.selectbox("Select transaction to delete", list(dl), format_func=dl.get, key="tx_del_sel")
             sure = st.checkbox("Yes, delete this transaction permanently", key="confirm_del_tx")
-            if st.button("Delete transaction", disabled=not sure):
-                run("DELETE FROM gogo_transactions WHERE id = %s", (int(dsel),))
-                ss.confirm_del_tx = False
-                st.rerun()
+            st.button("Delete transaction", disabled=not sure, on_click=delete_tx)
 
 # ==========================================================
 # PAGE: UNPAID & OWED
@@ -1046,21 +1076,22 @@ elif page == PAGES[3]:
     ledger = build_ledger(float(settings["gogo_start"]))
     gogo_bal = float(settings["gogo_start"]) + (ledger.loc[ledger["Date"].dt.date <= TODAY, "Amount"].sum() if not ledger.empty else 0.0)
 
-    unpaid = shifts[(shifts["employer"] != "GOGO") & (~shifts["paid"])] if not shifts.empty else pd.DataFrame()
+    unpaid = shifts[~shifts["paid"]] if not shifts.empty else pd.DataFrame()
     cols = st.columns(len(EMPLOYERS))
     for i, emp in enumerate(EMPLOYERS):
         with cols[i]:
+            sub = unpaid[unpaid["employer"] == emp] if not unpaid.empty else unpaid
+            tot = float(sub["gross_earning"].sum()) if not sub.empty else 0.0
             if emp == "GOGO":
-                card("GOGO (ledger)", gbp(gogo_bal), "owed to you" if gogo_bal >= 0 else "you owe owner", "green" if gogo_bal >= 0 else "red")
+                card("GOGO (ledger balance)", gbp(gogo_bal),
+                     f"{len(sub)} shift(s) marked unpaid · {gbp(tot)}", "green" if gogo_bal >= 0 else "red")
             else:
-                sub = unpaid[unpaid["employer"] == emp] if not unpaid.empty else unpaid
-                tot = float(sub["gross_earning"].sum()) if not sub.empty else 0.0
                 card(emp, gbp(tot), f"{len(sub)} unpaid shift(s)", "amber" if tot > 0 else "slate")
 
     st.markdown("---")
     st.subheader("Unpaid shifts")
     if unpaid.empty:
-        st.success("🎉 Nothing outstanding — every non-GOGO shift is marked as paid.")
+        st.success("🎉 Nothing outstanding — every shift is marked as paid.")
     else:
         ed = unpaid[["id", "shift_date", "employer", "start_time", "end_time", "hours_worked", "gross_earning"]].copy()
         ed.insert(0, "Paid?", False)
@@ -1080,7 +1111,7 @@ elif page == PAGES[3]:
                 st.rerun()
             else:
                 st.warning("Tick at least one shift first.")
-        emp_pick = c2.selectbox("Or mark everything paid for", [e for e in EMPLOYERS if e != "GOGO"], key="mark_all_emp")
+        emp_pick = c2.selectbox("Or mark everything paid for", EMPLOYERS, key="mark_all_emp")
         if c2.button(f"Mark all {emp_pick} as paid"):
             run("UPDATE shifts SET paid = TRUE WHERE employer = %s AND paid = FALSE", (emp_pick,))
             ss.flash = ("success", f"All {emp_pick} shifts marked as paid.")
@@ -1399,7 +1430,7 @@ elif page == PAGES[7]:
                             hrs = calculate_hours(st_t, en_t)
                             rate = num(r, "hourly_rate") or float(settings[f"rate_{r['employer']}"])
                             hE, mE, gE, _w = compute_shift(r["employer"], hrs, rate, num(r, "total_paid"), num(r, "mileage_earning"), num(r, "tips"))
-                            pd_flag = True if r["employer"] == "GOGO" else (bool(r["paid"]) if "paid" in imp.columns and pd.notna(r["paid"]) else True)
+                            pd_flag = bool(r["paid"]) if "paid" in imp.columns and pd.notna(r["paid"]) else True
                             insert_shift(r["_date"].date(), r["employer"], st_t.strftime("%H:%M"), en_t.strftime("%H:%M"),
                                          rate, hrs, hE, mE, num(r, "tips"), num(r, "fuel_cost"), num(r, "expense_cost"), gE, num(r, "miles"), pd_flag)
                             n += 1
