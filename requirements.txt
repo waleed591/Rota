@@ -1,3 +1,6 @@
 streamlit
 pandas
 psycopg2-binary
+openpyxl
+reportlab
+qrcode[pil]   # optional, shows a QR code for 2FA
