@@ -530,6 +530,62 @@ def make_statement_pdf(period, opening, closing, wages, rent, paid, s_d, e_d):
     return buf.getvalue()
 
 
+def make_employer_pdf(emp, sel, s_d, e_d, flt):
+    """Per-employer statement: every shift with PAID / UNPAID status (hourly pay only)."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    paid_amt = float(sel.loc[sel["paid"], "hourly_earning"].sum())
+    unpaid_amt = float(sel.loc[~sel["paid"], "hourly_earning"].sum())
+    total_amt = paid_amt + unpaid_amt
+    hours = float(sel["hours_worked"].sum())
+    red = colors.HexColor("#b91c1c")
+
+    els = [Paragraph(f"{html.escape(emp)} - Shift Statement", styles["Title"]),
+           Paragraph(f"Period: {s_d:%d %b %Y} to {e_d:%d %b %Y} &nbsp;|&nbsp; Showing: {html.escape(flt)} "
+                     f"&nbsp;|&nbsp; Generated {TODAY:%d %b %Y}", styles["Normal"]),
+           Spacer(1, 6),
+           Paragraph("Amounts are hourly pay only (mileage and tips are paid on the day).", styles["Italic"]),
+           Spacer(1, 12)]
+    summary = Table([["Shifts", str(len(sel))], ["Total hours", f"{hours:.2f}"],
+                     ["Total hourly pay", gbp(total_amt)], ["Paid", gbp(paid_amt)],
+                     ["UNPAID (amount owed)", gbp(unpaid_amt)]], colWidths=[200, 120])
+    summary.setStyle(TableStyle([("FONTNAME", (0, 4), (-1, 4), "Helvetica-Bold"),
+                                 ("TEXTCOLOR", (0, 4), (-1, 4), red),
+                                 ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                                 ("LINEABOVE", (0, 4), (-1, 4), 1, colors.black),
+                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    els += [summary, Spacer(1, 18)]
+
+    rows = [["Date", "Time", "Hours", "Rate (£)", "Hourly pay (£)", "Status"]]
+    style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")),
+             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+             ("FONTSIZE", (0, 0), (-1, -1), 9),
+             ("ALIGN", (2, 0), (4, -1), "RIGHT"),
+             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1"))]
+    for i, r in enumerate(sel.itertuples(), start=1):
+        rows.append([f"{r.shift_date:%a %d %b %Y}", f"{r.start_time}-{r.end_time}", f"{r.hours_worked:.2f}",
+                     f"{r.hourly_rate:.2f}", f"{r.hourly_earning:.2f}", "PAID" if r.paid else "UNPAID"])
+        if not r.paid:
+            style += [("BACKGROUND", (0, i), (-1, i), colors.HexColor("#fee2e2")),
+                      ("TEXTCOLOR", (5, i), (5, i), red), ("FONTNAME", (5, i), (5, i), "Helvetica-Bold")]
+    n = len(rows)
+    rows.append(["TOTAL", "", f"{hours:.2f}", "", f"{total_amt:.2f}", ""])
+    style += [("FONTNAME", (0, n), (-1, n), "Helvetica-Bold"), ("LINEABOVE", (0, n), (-1, n), 1, colors.black)]
+    tbl = Table(rows, repeatRows=1, colWidths=[95, 90, 50, 60, 85, 60])
+    tbl.setStyle(TableStyle(style))
+    els.append(tbl)
+    doc.build(els)
+    return buf.getvalue()
+
+
 # ---------- tax maths ----------
 def uk_tax_year(d):
     return d.year if (d.month, d.day) >= (4, 6) else d.year - 1
@@ -774,6 +830,14 @@ elif page == PAGES[1]:
     with k[2]: card("Fuel & expenses", gbp(-deduct_total), "", "red")
     with k[3]: card("NET EARNINGS" if show_net else "TOTAL EARNINGS", gbp(headline),
                     f"gross {gbp(gross_total)}" if show_net else "before costs", "green" if headline >= 0 else "red")
+
+    unp = fdf[~fdf["paid"]]
+    k = st.columns(3)
+    with k[0]: card("Unpaid (hourly pay)", gbp(unp["hourly_earning"].sum()), "mileage & tips are paid on the day",
+                    "amber" if len(unp) else "green")
+    with k[1]: card("Unpaid shifts", f"{len(unp)}", f"{unp['hours_worked'].sum():.2f} hrs outstanding",
+                    "red" if len(unp) else "slate")
+    with k[2]: card("Paid (hourly pay)", gbp(fdf.loc[fdf["paid"], "hourly_earning"].sum()), "already received", "green")
 
     st.markdown("---")
     tab_log, tab_week, tab_emp = st.tabs(["📋 Shift log", "📈 Weekly trend", "🏢 By employer"])
@@ -1081,7 +1145,7 @@ elif page == PAGES[3]:
     for i, emp in enumerate(EMPLOYERS):
         with cols[i]:
             sub = unpaid[unpaid["employer"] == emp] if not unpaid.empty else unpaid
-            tot = float(sub["gross_earning"].sum()) if not sub.empty else 0.0
+            tot = float(sub["hourly_earning"].sum()) if not sub.empty else 0.0
             if emp == "GOGO":
                 card("GOGO (ledger balance)", gbp(gogo_bal),
                      f"{len(sub)} shift(s) marked unpaid · {gbp(tot)}", "green" if gogo_bal >= 0 else "red")
@@ -1090,10 +1154,11 @@ elif page == PAGES[3]:
 
     st.markdown("---")
     st.subheader("Unpaid shifts")
+    st.caption("Amounts owed are **hourly pay only** — mileage and tips are paid on the day.")
     if unpaid.empty:
         st.success("🎉 Nothing outstanding — every shift is marked as paid.")
     else:
-        ed = unpaid[["id", "shift_date", "employer", "start_time", "end_time", "hours_worked", "gross_earning"]].copy()
+        ed = unpaid[["id", "shift_date", "employer", "start_time", "end_time", "hours_worked", "hourly_earning"]].copy()
         ed.insert(0, "Paid?", False)
         edited = st.data_editor(ed, hide_index=True, key="unpaid_editor",
                                 disabled=[c for c in ed.columns if c != "Paid?"],
@@ -1101,7 +1166,7 @@ elif page == PAGES[3]:
                                                "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
                                                "employer": "Location", "start_time": "Start", "end_time": "End",
                                                "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
-                                               "gross_earning": st.column_config.NumberColumn("Owed (£)", format="%.2f")})
+                                               "hourly_earning": st.column_config.NumberColumn("Owed – hourly pay (£)", format="%.2f")})
         c1, c2 = st.columns(2)
         if c1.button("✅ Mark ticked as paid", type="primary"):
             ids = edited.loc[edited["Paid?"], "id"].astype(int).tolist()
@@ -1116,6 +1181,62 @@ elif page == PAGES[3]:
             run("UPDATE shifts SET paid = TRUE WHERE employer = %s AND paid = FALSE", (emp_pick,))
             ss.flash = ("success", f"All {emp_pick} shifts marked as paid.")
             st.rerun()
+
+    st.markdown("---")
+    st.subheader("📄 Employer statement (PDF)")
+    st.caption("Every shift with its **Paid / Unpaid** status. Amounts are hourly pay only.")
+    if shifts.empty:
+        st.info("No shifts recorded yet.")
+    else:
+        s1, s2, s3 = st.columns(3)
+        st_emp = s1.selectbox("Employer", EMPLOYERS, key="stmt_emp")
+        emp_sh = shifts[shifts["employer"] == st_emp]
+        if emp_sh.empty:
+            st.info(f"No {st_emp} shifts recorded yet.")
+        else:
+            lo, hi = emp_sh["shift_date"].min().date(), max(TODAY, emp_sh["shift_date"].max().date())
+            rng = s2.date_input("Period", value=(lo, hi), key=f"stmt_rng_{st_emp}")
+            flt = s3.radio("Include", ["All shifts", "Unpaid only", "Paid only"], key="stmt_filter")
+            if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+                st.info("Pick an end date for the period.")
+            else:
+                dts = emp_sh["shift_date"].dt.date
+                sel = emp_sh[(dts >= rng[0]) & (dts <= rng[1])]
+                if flt == "Unpaid only":
+                    sel = sel[~sel["paid"]]
+                elif flt == "Paid only":
+                    sel = sel[sel["paid"]]
+                sel = sel.sort_values("shift_date")
+                if sel.empty:
+                    st.info("No shifts match these choices.")
+                else:
+                    paid_amt = float(sel.loc[sel["paid"], "hourly_earning"].sum())
+                    unpaid_amt = float(sel.loc[~sel["paid"], "hourly_earning"].sum())
+                    q = st.columns(3)
+                    with q[0]: card("Total hourly pay", gbp(paid_amt + unpaid_amt), f"{len(sel)} shift(s)", "indigo")
+                    with q[1]: card("Paid", gbp(paid_amt), "", "green")
+                    with q[2]: card("Unpaid", gbp(unpaid_amt), "amount owed", "amber" if unpaid_amt > 0 else "slate")
+
+                    prev = sel[["shift_date", "start_time", "end_time", "hours_worked", "hourly_rate", "hourly_earning", "paid"]].copy()
+                    prev["status"] = prev["paid"].map({True: "✅ Paid", False: "⏳ Unpaid"})
+                    show_table(prev.drop(columns=["paid"]), {
+                        "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
+                        "start_time": "Start", "end_time": "End",
+                        "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
+                        "hourly_rate": st.column_config.NumberColumn("Rate (£)", format="%.2f"),
+                        "hourly_earning": st.column_config.NumberColumn("Hourly pay (£)", format="%.2f"),
+                        "status": "Status"})
+
+                    sig = (st_emp, str(rng[0]), str(rng[1]), flt, len(sel), round(unpaid_amt, 2))
+                    if st.button("📄 Prepare PDF statement", key="prep_emp_pdf"):
+                        ss.emp_pdf = {"sig": sig, "bytes": make_employer_pdf(st_emp, sel, rng[0], rng[1], flt)}
+                    pdf = ss.get("emp_pdf")
+                    if pdf and pdf["sig"] == sig:
+                        if pdf["bytes"] is None:
+                            st.caption("PDF export needs `reportlab` in requirements.txt.")
+                        else:
+                            st.download_button("⬇️ Download PDF statement", pdf["bytes"],
+                                               f"{st_emp.lower()}_statement_{TODAY:%Y%m%d}.pdf", "application/pdf")
 
 # ==========================================================
 # PAGE: GOALS & INSIGHTS
