@@ -290,18 +290,21 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS shift_templates (
           id SERIAL PRIMARY KEY, name TEXT, employer TEXT, start_time TEXT, end_time TEXT, hourly_rate REAL)""",
     "CREATE TABLE IF NOT EXISTS login_attempts (id SERIAL PRIMARY KEY, ts TIMESTAMP DEFAULT NOW(), ok BOOLEAN)",
+    """CREATE TABLE IF NOT EXISTS personal_expenses (
+          id SERIAL PRIMARY KEY, expense_date DATE, category TEXT, amount NUMERIC(10,2), notes TEXT)""",
 ]
+SCHEMA_VERSION = 3  # bump whenever SCHEMA changes so the cached init runs again
 
 
 @st.cache_resource(show_spinner=False)
-def init_schema(url):
+def init_schema(url, version):
     for stmt in SCHEMA:
         run(stmt)
     return True
 
 
 try:
-    init_schema(DATABASE_URL)
+    init_schema(DATABASE_URL, SCHEMA_VERSION)
     DB_ERROR = None
 except Exception as e:
     DB_ERROR = str(e)
@@ -606,6 +609,60 @@ def make_employer_pdf(emp, sel, s_d, e_d, flt):
     return buf.getvalue()
 
 
+# ---------- personal finance helpers ----------
+EXPENSE_CATS = ["Food", "Grocery", "Train to Uni", "Car", "Car Insurance", "Send Home", "Mobile Bill"]
+CAT_ICONS = {"Food": "🍔", "Grocery": "🛒", "Train to Uni": "🚆", "Car": "🚗",
+             "Car Insurance": "🛡️", "Send Home": "🏠", "Mobile Bill": "📱"}
+
+
+def add_months(d, n):
+    y = d.year + (d.month - 1 + n) // 12
+    m = (d.month - 1 + n) % 12 + 1
+    return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+
+def month_bounds(y, m):
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
+def load_expenses():
+    cols = ["id", "expense_date", "category", "amount", "notes"]
+    try:
+        df = query_df("SELECT * FROM personal_expenses")
+    except Exception as e:
+        st.error(f"Error loading expenses: {e}")
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return df
+    df["expense_date"] = pd.to_datetime(df["expense_date"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    return df.sort_values(["expense_date", "id"], ascending=[False, False]).reset_index(drop=True)
+
+
+def earnings_in(shifts, s_d, e_d, use_net, only_paid):
+    """Total earnings from the shifts table between two dates -> (amount, number_of_shifts)."""
+    if shifts.empty:
+        return 0.0, 0
+    d = shifts["shift_date"].dt.date
+    sub = shifts[(d >= s_d) & (d <= e_d)]
+    if only_paid:
+        sub = sub[sub["paid"]]
+    if sub.empty:
+        return 0.0, 0
+    val = sub["gross_earning"] - ((sub["fuel_cost"] + sub["expense_cost"]) if use_net else 0.0)
+    return float(val.sum()), len(sub)
+
+
+def monthly_earnings(shifts, use_net, only_paid):
+    if shifts.empty:
+        return pd.Series(dtype=float)
+    sub = shifts[shifts["paid"]] if only_paid else shifts
+    if sub.empty:
+        return pd.Series(dtype=float)
+    val = sub["gross_earning"] - ((sub["fuel_cost"] + sub["expense_cost"]) if use_net else 0.0)
+    return val.groupby(sub["shift_date"].dt.to_period("M")).sum()
+
+
 # ---------- tax maths ----------
 def uk_tax_year(d):
     return d.year if (d.month, d.day) >= (4, 6) else d.year - 1
@@ -627,7 +684,7 @@ def est_class4_ni(profit, s):
 # SIDEBAR / NAV
 # ==========================================================
 PAGES = ["➕ Enter Rota", "📊 History & Earnings", "🏠 GOGO Ledger", "💼 Unpaid & Owed",
-         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "🛠️ Settings & Backup"]
+         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "💰 Personal Finance & Expenses", "🛠️ Settings & Backup"]
 
 bar_l, bar_r = st.columns([5, 1])
 with bar_l:
@@ -1460,9 +1517,242 @@ elif page == PAGES[6]:
         st.caption("Log **Miles driven** when entering shifts to unlock per-mile figures.")
 
 # ==========================================================
-# PAGE: SETTINGS & BACKUP
+# PAGE: PERSONAL FINANCE & EXPENSES
 # ==========================================================
 elif page == PAGES[7]:
+    hero("💰 Personal Finance & Expenses",
+         "See what you earn, what you spend and what you keep — and test budget scenarios by switching categories on and off.")
+    show_flash()
+
+    ss.setdefault("fin_ver", 0)
+    ss.setdefault("fin_amt", 0.0)
+    ss.setdefault("fin_notes", "")
+    ss.setdefault("fin_repeat", 0)
+    for _i in range(len(EXPENSE_CATS)):
+        ss.setdefault(f"fin_cat_{_i}", True)
+
+    def set_all_cats(flag):
+        for i in range(len(EXPENSE_CATS)):
+            ss[f"fin_cat_{i}"] = flag
+
+    def add_expense():
+        amt = float(ss.fin_amt)
+        if amt <= 0:
+            ss.flash = ("error", "Enter an amount greater than £0.")
+            return
+        reps = int(ss.fin_repeat)
+        base = (ss.fin_notes or "").strip()
+        for i in range(reps + 1):
+            note = base if reps == 0 else f"{base} (recurring {i + 1}/{reps + 1})".strip()
+            run("INSERT INTO personal_expenses (expense_date, category, amount, notes) VALUES (%s,%s,%s,%s)",
+                (add_months(ss.fin_date, i), ss.fin_cat, round(amt, 2), note))
+        ss.fin_amt, ss.fin_notes, ss.fin_repeat = 0.0, "", 0
+        ss.flash = ("success", f"Added {reps + 1} expense(s) to {ss.fin_cat}." if reps else f"Added {gbp(amt)} to {ss.fin_cat}.")
+
+    shifts = load_shifts()
+    expenses = load_expenses()
+
+    # ---------- period ----------
+    mode = st.radio("Period", ["This month", "Last month", "Pick a month", "Custom range"], horizontal=True, key="fin_mode")
+    if mode == "This month":
+        s_d, e_d = month_bounds(TODAY.year, TODAY.month)
+    elif mode == "Last month":
+        pm = add_months(TODAY.replace(day=1), -1)
+        s_d, e_d = month_bounds(pm.year, pm.month)
+    elif mode == "Pick a month":
+        c1, c2 = st.columns(2)
+        yr = int(c1.number_input("Year", min_value=2020, max_value=2100, value=TODAY.year, step=1, key="fin_year"))
+        mo = c2.selectbox("Month", list(range(1, 13)), index=TODAY.month - 1,
+                          format_func=lambda m: calendar.month_name[m], key="fin_month")
+        s_d, e_d = month_bounds(yr, mo)
+    else:
+        rng = st.date_input("Date range", value=month_bounds(TODAY.year, TODAY.month), key="fin_range")
+        if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+            st.info("Pick an end date.")
+            st.stop()
+        s_d, e_d = rng
+    period_label = f"{s_d:%d %b %Y} → {e_d:%d %b %Y}"
+
+    with st.expander("⚙️ Earnings options"):
+        basis = st.radio("Earnings basis", ["Gross earnings", "Net of fuel & expenses logged on shifts"], key="fin_basis")
+        only_paid = st.checkbox("Count only shifts marked as paid", key="fin_only_paid")
+        st.caption("Earnings come straight from your shifts for the selected period (hourly + mileage + tips).")
+    use_net = basis.startswith("Net")
+
+    # ---------- category toggles ----------
+    st.markdown("---")
+    st.subheader("🎛️ Budget scenario")
+    st.caption("Untick a category to leave it out — your totals and savings update straight away.")
+    tcols = st.columns(4)
+    for i, c in enumerate(EXPENSE_CATS):
+        tcols[i % 4].checkbox(f"{CAT_ICONS[c]} {c}", key=f"fin_cat_{i}")
+    bb1, bb2, _sp = st.columns([1, 1, 3])
+    bb1.button("Select all", on_click=set_all_cats, args=(True,))
+    bb2.button("Clear all", on_click=set_all_cats, args=(False,))
+    active = [c for i, c in enumerate(EXPENSE_CATS) if ss[f"fin_cat_{i}"]]
+
+    # ---------- numbers ----------
+    if expenses.empty:
+        exp_p = expenses
+    else:
+        _d = expenses["expense_date"].dt.date
+        exp_p = expenses[(_d >= s_d) & (_d <= e_d)]
+
+    spend = {c: 0.0 for c in EXPENSE_CATS}
+    cnt = {c: 0 for c in EXPENSE_CATS}
+    if not exp_p.empty:
+        g = exp_p.groupby("category")["amount"].agg(["sum", "count"])
+        for c in EXPENSE_CATS:
+            if c in g.index:
+                spend[c], cnt[c] = float(g.loc[c, "sum"]), int(g.loc[c, "count"])
+
+    all_total = sum(spend.values())
+    counted_total = sum(spend[c] for c in active)
+    excluded_total = all_total - counted_total
+    earn, n_shifts = earnings_in(shifts, s_d, e_d, use_net, only_paid)
+    saved = earn - counted_total
+    saved_all = earn - all_total
+    rate = saved / earn * 100 if earn > 0 else None
+    good = saved >= 0
+
+    st.markdown("---")
+    st.markdown(
+        f'<div class="balance {"owed" if good else "owe"}"><div>'
+        f'<div class="b-label">{"Money saved" if good else "Overspent"} · {period_label}</div>'
+        f'<div class="b-value">{"▲" if good else "▼"} {gbp(abs(saved))}</div></div>'
+        f'<div class="b-label">{len(active)} of {len(EXPENSE_CATS)} categories counted</div></div>',
+        unsafe_allow_html=True)
+
+    r1 = st.columns(4)
+    with r1[0]: card("Earnings", gbp(earn), f"{n_shifts} shift(s) · {'net' if use_net else 'gross'}", "indigo")
+    with r1[1]: card("Counted expenses", gbp(counted_total), f"{sum(cnt[c] for c in active)} entries", "red" if counted_total > 0 else "slate")
+    with r1[2]: card("Saved" if good else "Overspent", gbp(saved), "▲ in the green" if good else "▼ spending exceeds earnings", "green" if good else "red")
+    with r1[3]: card("Savings rate", f"{rate:.0f}%" if rate is not None else "n/a", "of earnings kept", "green" if good else "red")
+
+    counted_spend = {c: spend[c] for c in active if spend[c] > 0}
+    big_name = max(counted_spend, key=counted_spend.get) if counted_spend else None
+    r2 = st.columns(3)
+    with r2[0]: card("Excluded by scenario", gbp(excluded_total), f"{len(EXPENSE_CATS) - len(active)} categor(ies) switched off", "slate")
+    with r2[1]: card("Saved if everything counted", gbp(saved_all), f"{gbp(saved - saved_all)} difference with your scenario", "green" if saved_all >= 0 else "red")
+    with r2[2]: card("Biggest counted category", f"{CAT_ICONS[big_name]} {big_name}" if big_name else "—", gbp(counted_spend[big_name]) if big_name else "no spending yet", "amber")
+
+    st.markdown("---")
+    tab_add, tab_cat, tab_month, tab_log = st.tabs(["➕ Add expense", "📊 Category breakdown", "📅 Monthly savings", "🧾 Expense log"])
+
+    # ---------- add ----------
+    with tab_add:
+        a1, a2 = st.columns(2, gap="large")
+        with a1:
+            st.date_input("Date", value=TODAY, key="fin_date")
+            st.selectbox("Category", EXPENSE_CATS, format_func=lambda c: f"{CAT_ICONS[c]} {c}", key="fin_cat")
+            st.number_input("Amount (£)", min_value=0.0, step=1.0, format="%.2f", key="fin_amt")
+        with a2:
+            st.text_input("Notes (optional)", placeholder="e.g. weekly shop, monthly pass", key="fin_notes")
+            st.number_input("Repeat monthly for extra months", min_value=0, max_value=36, step=1, key="fin_repeat",
+                            help="For recurring costs (car insurance, mobile bill…): 3 adds this expense now plus the next 3 months.")
+            st.caption("Recurring entries are created on the same day each month and can be edited or deleted individually.")
+            st.button("Add expense", type="primary", on_click=add_expense)
+
+    # ---------- category breakdown ----------
+    with tab_cat:
+        rows = [{"Category": f"{CAT_ICONS[c]} {c}", "Spend": spend[c],
+                 "Share": (spend[c] / counted_total * 100 if (c in active and counted_total > 0) else 0.0),
+                 "Entries": cnt[c], "Status": "✅ Counted" if c in active else "➖ Excluded"} for c in EXPENSE_CATS]
+        table = pd.DataFrame(rows).sort_values("Spend", ascending=False)
+        st.caption(f"Total spend per category · {period_label}")
+        show_table(table, {
+            "Spend": st.column_config.NumberColumn("Total spend (£)", format="%.2f"),
+            "Share": st.column_config.ProgressColumn("Share of counted spend", format="%.0f%%", min_value=0, max_value=100),
+            "Entries": st.column_config.NumberColumn("Entries", format="%d")})
+        t1, t2 = st.columns(2)
+        with t1: card("All categories", gbp(all_total), "everything logged in this period", "slate")
+        with t2: card("Counted in scenario", gbp(counted_total), "used for the savings figure", "indigo")
+        chart = pd.Series({c: spend[c] for c in active}).sort_values(ascending=False) if active else pd.Series(dtype=float)
+        if chart.sum() > 0:
+            st.caption("Counted categories only")
+            st.bar_chart(chart, color="#6366f1")
+        else:
+            st.info("No counted spending in this period yet.")
+
+    # ---------- monthly savings ----------
+    with tab_month:
+        e_m = monthly_earnings(shifts, use_net, only_paid)
+        x_m = pd.Series(dtype=float)
+        if not expenses.empty:
+            ex = expenses[expenses["category"].isin(active)]
+            if not ex.empty:
+                x_m = ex.groupby(ex["expense_date"].dt.to_period("M"))["amount"].sum()
+        months = sorted(set(e_m.index) | set(x_m.index))
+        if not months:
+            st.info("Add shifts and expenses to see your month-by-month savings.")
+        else:
+            mdf = pd.DataFrame({"Month": months})
+            mdf["Earnings"] = [float(e_m.get(m, 0.0)) for m in months]
+            mdf["Expenses"] = [float(x_m.get(m, 0.0)) for m in months]
+            mdf["Saved"] = mdf["Earnings"] - mdf["Expenses"]
+            mdf["Result"] = mdf["Saved"].apply(lambda v: "🟢 Saved" if v >= 0 else "🔴 Overspent")
+            st.caption("Total money saved each month (uses the categories ticked above)")
+            ch = mdf.tail(12).copy()
+            ch.index = [m.strftime("%Y-%m") for m in ch["Month"]]
+            st.bar_chart(pd.DataFrame({"Saved": ch["Saved"].clip(lower=0), "Overspent": ch["Saved"].clip(upper=0)}),
+                         color=["#10b981", "#ef4444"])
+            out = mdf.sort_values("Month", ascending=False).copy()
+            out["Month"] = out["Month"].dt.strftime("%b %Y")
+            nm = lambda t: st.column_config.NumberColumn(t, format="%.2f")
+            show_table(out[["Month", "Earnings", "Expenses", "Saved", "Result"]],
+                       {"Earnings": nm("Earnings (£)"), "Expenses": nm("Expenses (£)"), "Saved": nm("Saved (£)")})
+
+    # ---------- expense log (editable) ----------
+    with tab_log:
+        if exp_p.empty:
+            st.info("No expenses logged for this period yet. Add one in the first tab.")
+        else:
+            view = exp_p.sort_values(["expense_date", "id"], ascending=[False, False]).copy()
+            view["expense_date"] = view["expense_date"].dt.date
+            view["notes"] = view["notes"].fillna("").astype(str)
+            view["amount"] = view["amount"].astype(float)
+            view["counted"] = view["category"].isin(active).map({True: "✅", False: "➖"})
+            view.insert(0, "Delete", False)
+            view = view[["Delete", "id", "expense_date", "category", "amount", "notes", "counted"]]
+            st.caption("Edit any cell directly, tick **Delete** to remove rows, then press **Save changes**.")
+            edited = st.data_editor(
+                view, hide_index=True, key=f"fin_editor_{ss.fin_ver}", disabled=["id", "counted"],
+                column_config={
+                    "Delete": st.column_config.CheckboxColumn("Delete"), "id": None,
+                    "expense_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
+                    "category": st.column_config.SelectboxColumn("Category", options=EXPENSE_CATS, required=True),
+                    "amount": st.column_config.NumberColumn("Amount (£)", min_value=0.01, format="%.2f", required=True),
+                    "notes": st.column_config.TextColumn("Notes"), "counted": "Counted"})
+            if st.button("💾 Save changes", type="primary", key="fin_save"):
+                orig = view.set_index("id")
+                n_upd = n_del = n_bad = 0
+                for _, r in edited.iterrows():
+                    rid = int(r["id"])
+                    if r["Delete"]:
+                        run("DELETE FROM personal_expenses WHERE id = %s", (rid,))
+                        n_del += 1
+                        continue
+                    o = orig.loc[rid]
+                    new_date = pd.to_datetime(r["expense_date"]).date() if pd.notna(r["expense_date"]) else None
+                    amt = r["amount"]
+                    if new_date is None or pd.isna(amt) or float(amt) <= 0 or r["category"] not in EXPENSE_CATS:
+                        n_bad += 1
+                        continue
+                    note = r["notes"] if isinstance(r["notes"], str) else ""
+                    if (new_date != o["expense_date"] or r["category"] != o["category"]
+                            or round(float(amt), 2) != round(float(o["amount"]), 2) or note != o["notes"]):
+                        run("UPDATE personal_expenses SET expense_date=%s, category=%s, amount=%s, notes=%s WHERE id=%s",
+                            (new_date, r["category"], round(float(amt), 2), note.strip(), rid))
+                        n_upd += 1
+                ss.fin_ver += 1
+                msg = f"Saved: {n_upd} updated, {n_del} deleted."
+                ss.flash = ("warning", msg + f" {n_bad} row(s) skipped (needs a date, category and amount above £0).") if n_bad else ("success", msg)
+                st.rerun()
+
+# ==========================================================
+# PAGE: SETTINGS & BACKUP
+# ==========================================================
+elif page == PAGES[8]:
     hero("🛠️ Settings & Backup", "Security, backups and CSV import.")
     show_flash()
     t_sec, t_bak, t_imp = st.tabs(["🔐 Security", "💾 Backup & restore", "📥 Import CSV"])
@@ -1505,6 +1795,7 @@ elif page == PAGES[7]:
                        "hourly_earning", "mileage_earning", "tips", "fuel_cost", "expense_cost", "gross_earning", "paid", "miles"],
             "gogo_transactions": ["id", "trans_date", "trans_type", "amount", "notes"],
             "shift_templates": ["id", "name", "employer", "start_time", "end_time", "hourly_rate"],
+            "personal_expenses": ["id", "expense_date", "category", "amount", "notes"],
             "app_settings": ["key", "value"],
         }
         st.markdown("#### Download a full backup")
