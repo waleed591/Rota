@@ -32,7 +32,7 @@ THEME_CSS = """
         radial-gradient(900px 500px at 100% 0%, rgba(20,184,166,.13), transparent 55%);
 }
 .block-container { padding-top: 2.2rem; max-width: 1250px; }
-#MainMenu, footer, [data-testid="stToolbar"], .stAppDeployButton,
+#MainMenu, footer, [data-testid="stToolbarActions"], [data-testid="stMainMenu"], .stAppDeployButton,
 [data-testid="stDecoration"] { display: none !important; }
 header[data-testid="stHeader"] { background: transparent; }
 
@@ -94,6 +94,26 @@ button[data-testid^="stBaseButton-secondary"] { border-radius: 12px !important; 
 [data-testid="stExpander"] { border-radius: 14px; border: 1px solid rgba(128,128,128,.25); background: rgba(128,128,128,.05); }
 [data-testid="stDataFrame"] { border-radius: 14px; overflow: hidden; border: 1px solid rgba(128,128,128,.2); }
 h2, h3 { letter-spacing: -.01em; font-weight: 700 !important; }
+
+/* Top navigation (works on phones, tablets and desktops) */
+.st-key-nav [role="radiogroup"] { flex-wrap: wrap; gap: 8px; }
+.st-key-nav label[data-baseweb="radio"] { margin: 0; padding: 8px 14px; border-radius: 999px; cursor: pointer;
+    border: 1px solid rgba(128,128,128,.3); background: rgba(128,128,128,.08); transition: all .15s ease; }
+.st-key-nav label[data-baseweb="radio"] > div:first-child { display: none; }
+.st-key-nav label[data-baseweb="radio"] p { font-weight: 600; font-size: .88rem; white-space: nowrap; }
+.st-key-nav label[data-baseweb="radio"]:has(input:checked) {
+    background: linear-gradient(120deg,#4f46e5,#7c3aed); border-color: transparent; box-shadow: 0 6px 16px rgba(79,70,229,.35); }
+.st-key-nav label[data-baseweb="radio"]:has(input:checked) p { color: #fff; }
+
+@media (max-width: 640px) {
+    .block-container { padding-left: 1rem; padding-right: 1rem; padding-top: 1.2rem; }
+    .hero { padding: 18px 20px; border-radius: 16px; }
+    .hero-title { font-size: 1.4rem; }
+    .card-value { font-size: 1.35rem; }
+    .balance .b-value { font-size: 1.8rem; }
+    .st-key-nav label[data-baseweb="radio"] { padding: 6px 11px; }
+    .st-key-nav label[data-baseweb="radio"] p { font-size: .8rem; }
+}
 </style>
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -609,19 +629,26 @@ def est_class4_ni(profit, s):
 PAGES = ["➕ Enter Rota", "📊 History & Earnings", "🏠 GOGO Ledger", "💼 Unpaid & Owed",
          "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "🛠️ Settings & Backup"]
 
-with st.sidebar:
+bar_l, bar_r = st.columns([5, 1])
+with bar_l:
     st.markdown('<div class="brand">💷 Rota Tracker</div>', unsafe_allow_html=True)
-    page = st.radio("Navigation", PAGES, label_visibility="collapsed")
-    st.divider()
+with bar_r:
     if st.button("🚪 Logout"):
         st.session_state.authenticated = False
         st.rerun()
+
+try:
+    nav_box = st.container(key="nav")
+except TypeError:  # very old Streamlit without container keys
+    nav_box = st.container()
+with nav_box:
+    page = st.radio("Navigation", PAGES, horizontal=True, label_visibility="collapsed", key="nav_page")
 
 settings = load_settings()
 try:
     apply_auto_rent(settings)
 except Exception as e:
-    st.sidebar.warning(f"Auto-rent skipped: {e}")
+    st.warning(f"Auto-rent skipped: {e}")
 
 ss = st.session_state
 
