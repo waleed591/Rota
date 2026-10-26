@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import html
 import io
+import json
 import os
 import secrets as pysecrets
 import struct
@@ -94,6 +95,9 @@ button[data-testid^="stBaseButton-secondary"] { border-radius: 12px !important; 
 [data-testid="stExpander"] { border-radius: 14px; border: 1px solid rgba(128,128,128,.25); background: rgba(128,128,128,.05); }
 [data-testid="stDataFrame"] { border-radius: 14px; overflow: hidden; border: 1px solid rgba(128,128,128,.2); }
 h2, h3 { letter-spacing: -.01em; font-weight: 700 !important; }
+a[data-testid="stBaseLinkButton-primary"] { background: linear-gradient(120deg,#16a34a,#22c55e) !important;
+    border: none !important; color: #fff !important; border-radius: 12px !important; font-weight: 600;
+    box-shadow: 0 6px 18px rgba(34,197,94,.35); }
 
 /* Top navigation (works on phones, tablets and desktops) */
 .st-key-nav [role="radiogroup"] { flex-wrap: wrap; gap: 8px; }
@@ -369,6 +373,7 @@ SETTING_DEFAULTS = {
     "gogo_rent": "400.00", "gogo_start": "384.75",
     "auto_rent": "0", "rent_day": "1", "auto_rent_since": "",
     "goal_weekly": "0", "goal_monthly": "0",
+    "wa_GOGO": "", "wa_CHINESE": "", "wa_DANIELLE": "",
     # UK tax (editable estimates - check gov.uk for the current tax year)
     "tax_pa": "12570", "tax_basic_upper": "50270", "tax_add_threshold": "125140",
     "tax_basic_rate": "20", "tax_higher_rate": "40", "tax_add_rate": "45",
@@ -385,6 +390,9 @@ def load_settings():
         stored = {}
     out = {}
     for k, v in {**SETTING_DEFAULTS, **stored}.items():
+        if k.startswith("wa_"):          # phone numbers stay as text
+            out[k] = str(v or "")
+            continue
         try:
             out[k] = float(v)
         except (TypeError, ValueError):
@@ -607,6 +615,72 @@ def make_employer_pdf(emp, sel, s_d, e_d, flt):
     els.append(tbl)
     doc.build(els)
     return buf.getvalue()
+
+
+# ---------- WhatsApp helpers ----------
+def normalize_phone(raw, default_cc="44"):
+    """'07123 456789' / '+44 (0)7123 456789' / '0044…' -> digits-only international number, or '' if invalid."""
+    s = str(raw or "").strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return ""
+    if s.startswith("+"):
+        pass
+    elif digits.startswith("00"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = default_cc + digits[1:]
+    if digits.startswith(default_cc + "0"):      # +44 (0)7… written with the optional trunk 0
+        digits = default_cc + digits[len(default_cc) + 1:]
+    return digits if 8 <= len(digits) <= 15 else ""
+
+
+def build_wa_message(emp, sel, s_d, e_d, limit=20):
+    un = sel[~sel["paid"]].sort_values("shift_date")
+    total = float(un["hourly_earning"].sum())
+    lines = ["Hi,", "", f"Here is my payment summary for {emp} shifts ({s_d:%d %b %Y} - {e_d:%d %b %Y}).", ""]
+    if un.empty:
+        lines.append("There are no unpaid shifts for this period. Thank you!")
+    else:
+        lines.append("Unpaid shifts (hourly pay):")
+        for r in un.head(limit).itertuples():
+            lines.append(f"• {r.shift_date:%a %d %b} {r.start_time}-{r.end_time} ({r.hours_worked:.2f} hrs) - {gbp(r.hourly_earning)}")
+        if len(un) > limit:
+            lines.append(f"…and {len(un) - limit} more shift(s)")
+        lines += ["", f"*Total unpaid: {gbp(total)}* ({len(un)} shift(s))", "",
+                  "The PDF statement with full details is attached.",
+                  "Could you please let me know when this will be paid? Thank you!"]
+    return "\n".join(lines)
+
+
+def wa_share_html(pdf_bytes, text, filename):
+    """A button that opens the phone's share sheet with the PDF + message (works only where the browser allows file sharing)."""
+    b64 = base64.b64encode(pdf_bytes).decode()
+    js_text = json.dumps(text).replace("</", "<\\/")
+    js_name = json.dumps(filename)
+    return f"""
+<div style="font-family:Inter,-apple-system,sans-serif">
+  <button id="sb" style="padding:.55rem 1.2rem;border:none;border-radius:12px;font-weight:600;font-size:14px;color:#fff;
+     cursor:pointer;background:linear-gradient(120deg,#4f46e5,#7c3aed);box-shadow:0 6px 18px rgba(79,70,229,.35)">📤 Share PDF + message</button>
+  <div id="sm" style="font-size:12px;margin-top:8px;color:#888"></div>
+</div>
+<script>
+const b64 = "{b64}", text = {js_text}, name = {js_name};
+document.getElementById("sb").onclick = async () => {{
+  const m = document.getElementById("sm");
+  try {{
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const file = new File([bytes], name, {{type: "application/pdf"}});
+    if (navigator.canShare && navigator.canShare({{files: [file]}})) {{
+      await navigator.share({{files: [file], text: text}});
+    }} else {{
+      m.textContent = "This browser can't share files from here. Use Download PDF + the WhatsApp button instead.";
+    }}
+  }} catch (e) {{
+    if (e.name !== "AbortError") m.textContent = "Sharing isn't available here (" + e.name + "). Use Download PDF + the WhatsApp button instead.";
+  }}
+}};
+</script>"""
 
 
 # ---------- personal finance helpers ----------
@@ -1269,6 +1343,23 @@ elif page == PAGES[3]:
     st.markdown("---")
     st.subheader("📄 Employer statement (PDF)")
     st.caption("Every shift with its **Paid / Unpaid** status. Amounts are hourly pay only.")
+    with st.expander("📱 Employer WhatsApp numbers"):
+        st.caption("Type UK numbers like 07123 456789 or international ones like +44 7123 456789.")
+        with st.form("wa_numbers_form"):
+            wc = st.columns(3)
+            new_nums = {}
+            for i, emp in enumerate(EMPLOYERS):
+                cur = normalize_phone(settings.get(f"wa_{emp}", ""))
+                new_nums[emp] = wc[i].text_input(emp, value=f"+{cur}" if cur else "", placeholder="07… or +44…")
+            if st.form_submit_button("Save numbers", type="primary"):
+                bad = [e for e, v in new_nums.items() if v.strip() and not normalize_phone(v)]
+                if bad:
+                    st.error(f"Couldn't read the number for: {', '.join(bad)}")
+                else:
+                    for e, v in new_nums.items():
+                        save_setting(f"wa_{e}", normalize_phone(v))
+                    ss.flash = ("success", "WhatsApp numbers saved.")
+                    st.rerun()
     if shifts.empty:
         st.info("No shifts recorded yet.")
     else:
@@ -1321,6 +1412,33 @@ elif page == PAGES[3]:
                         else:
                             st.download_button("⬇️ Download PDF statement", pdf["bytes"],
                                                f"{st_emp.lower()}_statement_{TODAY:%Y%m%d}.pdf", "application/pdf")
+
+                    st.markdown("#### 💬 Send via WhatsApp")
+                    num = normalize_phone(settings.get(f"wa_{st_emp}", ""))
+                    if num:
+                        st.caption(f"Opens a chat with {st_emp} (+{num}) with the message below already typed.")
+                    else:
+                        st.info(f"No WhatsApp number saved for {st_emp}. WhatsApp will let you pick the contact — "
+                                "or save a number in “Employer WhatsApp numbers” above.")
+                    msg_key = "wa_msg_" + hashlib.md5(str(sig).encode()).hexdigest()[:8]
+                    wa_msg = st.text_area("Message (edit it if you like)", value=build_wa_message(st_emp, sel, rng[0], rng[1]),
+                                          height=230, key=msg_key)
+                    from urllib.parse import quote
+                    wa_url = f"https://wa.me/{num}?text={quote(wa_msg)}" if num else f"https://wa.me/?text={quote(wa_msg)}"
+                    w1, w2 = st.columns(2)
+                    with w1:
+                        try:
+                            st.link_button("💬 Open WhatsApp with message", wa_url, type="primary")
+                        except AttributeError:   # very old Streamlit
+                            st.markdown(f'<a href="{wa_url}" target="_blank">💬 Open WhatsApp with message</a>', unsafe_allow_html=True)
+                    with w2:
+                        if pdf and pdf["sig"] == sig and pdf["bytes"] is not None:
+                            import streamlit.components.v1 as components
+                            components.html(wa_share_html(pdf["bytes"], wa_msg, f"{st_emp.lower()}_statement_{TODAY:%Y%m%d}.pdf"), height=95)
+                        else:
+                            st.caption("Press **Prepare PDF statement** above to enable “Share PDF + message”.")
+                    st.caption("WhatsApp links can't attach files. Either download the PDF and add it with the 📎 paperclip, "
+                               "or try “Share PDF + message” (works on many phones, but not every browser allows it).")
 
 # ==========================================================
 # PAGE: GOALS & INSIGHTS
