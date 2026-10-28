@@ -6,6 +6,7 @@ import html
 import io
 import json
 import os
+import re
 import secrets as pysecrets
 import struct
 import time as time_mod
@@ -211,17 +212,13 @@ def make_password_hash(pw, iters=200_000):
     return f"pbkdf2_sha256${iters}${salt}${digest}"
 
 
-def verify_password(pw):
-    stored_hash = get_secret("APP_PASSWORD_HASH")
-    if stored_hash:
-        try:
-            _, iters, salt, digest = str(stored_hash).split("$")
-            calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), int(iters)).hex()
-            return hmac.compare_digest(calc, digest)
-        except Exception:
-            return False
-    plain = get_secret("APP_PASSWORD")
-    return bool(plain) and hmac.compare_digest(pw.encode(), str(plain).encode())
+def verify_hash(pw, stored):
+    try:
+        _, iters, salt, digest = str(stored).split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), int(iters)).hex()
+        return hmac.compare_digest(calc, digest)
+    except Exception:
+        return False
 
 
 def totp_now(secret, t=None, step=30, digits=6):
@@ -239,6 +236,15 @@ def verify_totp(secret, code):
     code = (code or "").strip().replace(" ", "")
     now = time_mod.time()
     return any(hmac.compare_digest(totp_now(secret, now + d * 30), code) for d in (-1, 0, 1))
+
+
+def uid():
+    """Id of the logged-in user. Every query is filtered by this, so users only ever see their own data."""
+    return int(st.session_state.user["id"])
+
+
+def is_admin():
+    return bool(st.session_state.get("user")) and st.session_state.user.get("role") == "admin"
 
 
 # ==========================================================
@@ -271,6 +277,7 @@ def get_conn():
 def run(sql, params=None):
     with get_conn().cursor() as cur:
         cur.execute(sql, params)
+        return cur.rowcount
 
 
 def query_df(sql, params=None):
@@ -296,14 +303,62 @@ SCHEMA = [
     "CREATE TABLE IF NOT EXISTS login_attempts (id SERIAL PRIMARY KEY, ts TIMESTAMP DEFAULT NOW(), ok BOOLEAN)",
     """CREATE TABLE IF NOT EXISTS personal_expenses (
           id SERIAL PRIMARY KEY, expense_date DATE, category TEXT, amount NUMERIC(10,2), notes TEXT)""",
+    # ---- multi-user ----
+    """CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'user', totp_secret TEXT, active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT NOW())""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (LOWER(username))",
+    "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE gogo_transactions ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE personal_expenses ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE login_attempts ADD COLUMN IF NOT EXISTS username TEXT",
+    "CREATE INDEX IF NOT EXISTS shifts_user_idx ON shifts (user_id)",
+    "CREATE INDEX IF NOT EXISTS gogo_user_idx ON gogo_transactions (user_id)",
+    "CREATE INDEX IF NOT EXISTS expenses_user_idx ON personal_expenses (user_id)",
 ]
-SCHEMA_VERSION = 3  # bump whenever SCHEMA changes so the cached init runs again
+SCHEMA_VERSION = 4  # bump whenever SCHEMA changes so the cached init runs again
+
+
+OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses")
+
+
+def bootstrap_admin():
+    """First start after upgrading: create the admin from the old secrets and give all existing data to them.
+    Set APP_RESET_ADMIN = "true" in the secrets (temporarily) to force-reset that admin's password / 2FA."""
+    uname = get_secret("APP_USERNAME")
+    pw_hash, plain = get_secret("APP_PASSWORD_HASH"), get_secret("APP_PASSWORD")
+    if uname and (pw_hash or plain):
+        n = int(query_df("SELECT COUNT(*) AS n FROM users")["n"].iloc[0])
+        reset = str(get_secret("APP_RESET_ADMIN", "")).strip().lower() in ("1", "true", "yes")
+        if n == 0 or reset:
+            stored = str(pw_hash) if pw_hash else make_password_hash(str(plain))
+            totp = get_secret("APP_TOTP_SECRET") or None
+            name = str(uname).strip()
+            hit = 0
+            if n > 0:
+                hit = run("UPDATE users SET password_hash=%s, totp_secret=%s, role='admin', active=TRUE "
+                          "WHERE LOWER(username)=LOWER(%s)", (stored, totp, name))
+            if not hit:
+                run("INSERT INTO users (username, password_hash, role, totp_secret) VALUES (%s,%s,'admin',%s)",
+                    (name, stored, totp))
+    admin = query_df("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+    if admin.empty:
+        return
+    aid = int(admin["id"].iloc[0])
+    for t in OWNED_TABLES:                      # data from before multi-user belongs to the first admin
+        run(f"UPDATE {t} SET user_id = %s WHERE user_id IS NULL", (aid,))
+    run("DELETE FROM app_settings a WHERE POSITION(':' IN a.key) = 0 AND "
+        "EXISTS (SELECT 1 FROM app_settings b WHERE b.key = %s || ':' || a.key)", (str(aid),))
+    run("UPDATE app_settings SET key = %s || ':' || key WHERE POSITION(':' IN key) = 0", (str(aid),))
 
 
 @st.cache_resource(show_spinner=False)
 def init_schema(url, version):
     for stmt in SCHEMA:
         run(stmt)
+    bootstrap_admin()
     return True
 
 
@@ -314,56 +369,81 @@ except Exception as e:
     DB_ERROR = str(e)
 
 # ==========================================================
-# AUTHENTICATION  (hashed password, optional 2FA, DB lockout)
+# AUTHENTICATION  (database users, per-user 2FA, per-username lockout)
 # ==========================================================
 MAX_FAILS = 5
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+    st.session_state.user = None
 
 if not st.session_state.authenticated:
     _, mid, _ = st.columns([1, 1.3, 1])
     with mid:
         st.markdown("<div style='height:7vh'></div>", unsafe_allow_html=True)
         hero("🔒 Rota Tracker", "Sign in to view your shifts and earnings.")
-        valid_user = get_secret("APP_USERNAME")
-        totp_secret = get_secret("APP_TOTP_SECRET")
 
         if DB_ERROR:
             st.error("⚠️ Database connection failed.")
-        elif not valid_user or not (get_secret("APP_PASSWORD") or get_secret("APP_PASSWORD_HASH")):
-            st.error("Login is not configured. Add `APP_USERNAME` and `APP_PASSWORD` "
-                     "(or `APP_PASSWORD_HASH`) to your Streamlit secrets.")
         else:
-            with st.form("login_form"):
-                username = st.text_input("Username", placeholder="Enter your username")
-                password = st.text_input("Password", type="password", placeholder="Enter your password")
-                code = st.text_input("2FA code", placeholder="6-digit code") if totp_secret else ""
-                submitted = st.form_submit_button("Sign in", type="primary")
+            try:
+                n_users = int(query_df("SELECT COUNT(*) AS n FROM users")["n"].iloc[0])
+            except Exception:
+                n_users = -1
+            if n_users == 0:
+                st.error("No accounts exist yet. Add `APP_USERNAME` and `APP_PASSWORD` (or `APP_PASSWORD_HASH`) "
+                         "to your Streamlit secrets and restart the app. The first admin account is created from them.")
+            else:
+                with st.form("login_form"):
+                    username = st.text_input("Username", placeholder="Enter your username")
+                    password = st.text_input("Password", type="password", placeholder="Enter your password")
+                    code = st.text_input("2FA code", placeholder="Only if you turned 2FA on")
+                    submitted = st.form_submit_button("Sign in", type="primary")
 
-            if submitted:
-                fails = int(query_df("SELECT COUNT(*) AS n FROM login_attempts WHERE ok = FALSE "
-                                     "AND ts > NOW() - INTERVAL '15 minutes'")["n"].iloc[0])
-                if fails >= MAX_FAILS:
-                    st.error("🚫 Too many failed attempts. Please try again in 15 minutes.")
-                else:
-                    ok_user = hmac.compare_digest(username.encode(), str(valid_user).encode())
-                    ok_pass = verify_password(password)
-                    ok_2fa = verify_totp(str(totp_secret), code) if totp_secret else True
-                    if ok_user and ok_pass and ok_2fa:
-                        run("DELETE FROM login_attempts")
-                        st.session_state.authenticated = True
-                        st.rerun()
+                if submitted:
+                    uname = username.strip()
+                    fails = int(query_df("SELECT COUNT(*) AS n FROM login_attempts WHERE ok = FALSE "
+                                         "AND LOWER(COALESCE(username,'')) = LOWER(%s) "
+                                         "AND ts > NOW() - INTERVAL '15 minutes'", (uname,))["n"].iloc[0])
+                    all_fails = int(query_df("SELECT COUNT(*) AS n FROM login_attempts WHERE ok = FALSE "
+                                             "AND ts > NOW() - INTERVAL '15 minutes'")["n"].iloc[0])
+                    if fails >= MAX_FAILS or all_fails >= MAX_FAILS * 6:
+                        st.error("🚫 Too many failed attempts. Please try again in 15 minutes.")
                     else:
-                        run("INSERT INTO login_attempts (ok) VALUES (FALSE)")
-                        time_mod.sleep(1)
-                        left = MAX_FAILS - fails - 1
-                        st.error(f"❌ Invalid credentials. {max(left, 0)} attempt(s) left before lockout.")
+                        row = query_df("SELECT id, username, password_hash, role, totp_secret, active "
+                                       "FROM users WHERE LOWER(username) = LOWER(%s)", (uname,))
+                        user = None if row.empty else row.iloc[0]
+                        stored = make_password_hash("not-a-real-user") if user is None else user["password_hash"]
+                        ok_pass = verify_hash(password, stored)      # always runs, so timing doesn't reveal valid usernames
+                        ok_user = user is not None and bool(user["active"])
+                        secret = user["totp_secret"] if user is not None else None
+                        ok_2fa = verify_totp(secret, code) if isinstance(secret, str) and secret else True
+                        if ok_user and ok_pass and ok_2fa:
+                            run("DELETE FROM login_attempts WHERE LOWER(COALESCE(username,'')) = LOWER(%s)", (uname,))
+                            st.session_state.authenticated = True
+                            st.session_state.user = {"id": int(user["id"]), "username": str(user["username"]),
+                                                     "role": str(user["role"])}
+                            st.rerun()
+                        else:
+                            run("INSERT INTO login_attempts (ok, username) VALUES (FALSE, %s)", (uname[:60],))
+                            time_mod.sleep(1)
+                            left = MAX_FAILS - fails - 1
+                            st.error(f"❌ Invalid credentials. {max(left, 0)} attempt(s) left before lockout.")
     st.stop()
 
 if DB_ERROR:
     st.error(f"⚠️ Database connection failed: {DB_ERROR}")
     st.stop()
+
+# Re-check the account on every run: a disabled or deleted user is signed out straight away,
+# and a changed role takes effect immediately.
+_me = query_df("SELECT username, role, active FROM users WHERE id = %s", (uid(),))
+if _me.empty or not bool(_me.iloc[0]["active"]):
+    for _k in list(st.session_state.keys()):
+        del st.session_state[_k]
+    st.rerun()
+st.session_state.user["role"] = str(_me.iloc[0]["role"])
+st.session_state.user["username"] = str(_me.iloc[0]["username"])
 
 # ==========================================================
 # SETTINGS
@@ -384,8 +464,9 @@ SETTING_DEFAULTS = {
 
 def load_settings():
     try:
-        rows = query_df("SELECT key, value FROM app_settings")
-        stored = dict(zip(rows["key"], rows["value"]))
+        prefix = f"{uid()}:"
+        rows = query_df("SELECT key, value FROM app_settings WHERE key LIKE %s", (prefix + "%",))
+        stored = {k[len(prefix):]: v for k, v in zip(rows["key"], rows["value"])}
     except Exception:
         stored = {}
     out = {}
@@ -402,7 +483,7 @@ def load_settings():
 
 def save_setting(key, value):
     run("""INSERT INTO app_settings (key, value) VALUES (%s, %s)
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""", (key, str(value)))
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""", (f"{uid()}:{key}", str(value)))
 
 
 # ==========================================================
@@ -414,7 +495,7 @@ SHIFT_NUM_COLS = ["hourly_rate", "hours_worked", "hourly_earning", "mileage_earn
 
 def load_shifts():
     try:
-        df = query_df("SELECT * FROM shifts")
+        df = query_df("SELECT * FROM shifts WHERE user_id = %s", (uid(),)).drop(columns=["user_id"], errors="ignore")
     except Exception as e:
         st.error(f"Error loading shifts: {e}")
         return pd.DataFrame()
@@ -430,7 +511,7 @@ def load_shifts():
 
 def load_trans():
     try:
-        df = query_df("SELECT * FROM gogo_transactions")
+        df = query_df("SELECT * FROM gogo_transactions WHERE user_id = %s", (uid(),)).drop(columns=["user_id"], errors="ignore")
     except Exception as e:
         st.error(f"Error loading transactions: {e}")
         return pd.DataFrame()
@@ -442,7 +523,7 @@ def load_trans():
 
 
 def load_templates():
-    return query_df("SELECT * FROM shift_templates ORDER BY name")
+    return query_df("SELECT * FROM shift_templates WHERE user_id = %s ORDER BY name", (uid(),)).drop(columns=["user_id"], errors="ignore")
 
 
 def calculate_hours(start_t, end_t):
@@ -468,10 +549,10 @@ def compute_shift(employer, hours, rate, paid_chinese, mileage, tips):
 
 
 def insert_shift(d, employer, start_s, end_s, rate, hours, hourly, mileage, tips, fuel, exp, gross, miles, paid):
-    run("""INSERT INTO shifts (shift_date, employer, start_time, end_time, hourly_rate, hours_worked,
+    run("""INSERT INTO shifts (user_id, shift_date, employer, start_time, end_time, hourly_rate, hours_worked,
                 hourly_earning, mileage_earning, tips, fuel_cost, expense_cost, gross_earning, miles, paid)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (d, employer, start_s, end_s, rate, round(hours, 2), round(hourly, 2), round(mileage, 2),
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (uid(), d, employer, start_s, end_s, rate, round(hours, 2), round(hourly, 2), round(mileage, 2),
          round(tips, 2), round(fuel, 2), round(exp, 2), round(gross, 2), round(miles, 1), bool(paid)))
 
 
@@ -511,14 +592,14 @@ def apply_auto_rent(s):
     except Exception:
         return
     day = int(min(max(s.get("rent_day", 1), 1), 28))
-    done = set(query_df("SELECT notes FROM gogo_transactions WHERE notes LIKE %s",
-                        ("auto-rent %",))["notes"].tolist())
+    done = set(query_df("SELECT notes FROM gogo_transactions WHERE user_id = %s AND notes LIKE %s",
+                        (uid(), "auto-rent %"))["notes"].tolist())
     y, m = since.year, since.month
     while (y, m) <= (TODAY.year, TODAY.month):
         due, tag = date(y, m, day), f"auto-rent {y}-{m:02d}"
         if due <= TODAY and tag not in done:
-            run("INSERT INTO gogo_transactions (trans_date, trans_type, amount, notes) VALUES (%s,'RENT',%s,%s)",
-                (due, float(s["gogo_rent"]), tag))
+            run("INSERT INTO gogo_transactions (user_id, trans_date, trans_type, amount, notes) VALUES (%s,%s,'RENT',%s,%s)",
+                (uid(), due, float(s["gogo_rent"]), tag))
         m += 1
         if m > 12:
             y, m = y + 1, 1
@@ -702,7 +783,7 @@ def month_bounds(y, m):
 def load_expenses():
     cols = ["id", "expense_date", "category", "amount", "notes"]
     try:
-        df = query_df("SELECT * FROM personal_expenses")
+        df = query_df("SELECT * FROM personal_expenses WHERE user_id = %s", (uid(),)).drop(columns=["user_id"], errors="ignore")
     except Exception as e:
         st.error(f"Error loading expenses: {e}")
         return pd.DataFrame(columns=cols)
@@ -762,10 +843,12 @@ PAGES = ["➕ Enter Rota", "📊 History & Earnings", "🏠 GOGO Ledger", "💼 
 
 bar_l, bar_r = st.columns([5, 1])
 with bar_l:
-    st.markdown('<div class="brand">💷 Rota Tracker</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="brand">💷 Rota Tracker <span style="font-size:.8rem;opacity:.6;font-weight:600">'
+                f'· {html.escape(st.session_state.user["username"])}</span></div>', unsafe_allow_html=True)
 with bar_r:
     if st.button("🚪 Logout"):
-        st.session_state.authenticated = False
+        for _k in list(st.session_state.keys()):   # wipe everything so nothing leaks to the next login
+            del st.session_state[_k]
         st.rerun()
 
 try:
@@ -798,7 +881,7 @@ if page == PAGES[0]:
         ss.rate_input = load_settings()[f"rate_{ss.employer_sel}"]
 
     def apply_template():
-        row = query_df("SELECT * FROM shift_templates WHERE id = %s", (int(ss.tpl_sel),))
+        row = query_df("SELECT * FROM shift_templates WHERE id = %s AND user_id = %s", (int(ss.tpl_sel), uid()))
         if row.empty:
             return
         r = row.iloc[0]
@@ -813,8 +896,8 @@ if page == PAGES[0]:
         if not name:
             ss.flash = ("error", "Give the template a name first.")
             return
-        run("INSERT INTO shift_templates (name, employer, start_time, end_time, hourly_rate) VALUES (%s,%s,%s,%s,%s)",
-            (name, ss.employer_sel, ss.start_time_in.strftime("%H:%M"), ss.end_time_in.strftime("%H:%M"),
+        run("INSERT INTO shift_templates (user_id, name, employer, start_time, end_time, hourly_rate) VALUES (%s,%s,%s,%s,%s,%s)",
+            (uid(), name, ss.employer_sel, ss.start_time_in.strftime("%H:%M"), ss.end_time_in.strftime("%H:%M"),
              float(ss.rate_input)))
         ss.tpl_name = ""
         ss.flash = ("success", f"Template “{name}” saved.")
@@ -845,7 +928,7 @@ if page == PAGES[0]:
                 b1, b2 = st.columns(2)
                 b1.button("Apply", on_click=apply_template)
                 if b2.button("Delete"):
-                    run("DELETE FROM shift_templates WHERE id = %s", (int(ss.tpl_sel),))
+                    run("DELETE FROM shift_templates WHERE id = %s AND user_id = %s", (int(ss.tpl_sel), uid()))
                     st.rerun()
             st.text_input("Save current form as template", placeholder="e.g. GOGO 9–5", key="tpl_name")
             st.button("Save template", on_click=save_template)
@@ -1025,7 +1108,7 @@ elif page == PAGES[1]:
         b1, b2, _sp = st.columns([1, 1, 2])
         if b1.button("✅ Mark selected as paid", type="primary"):
             if picked:
-                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s)", (picked,))
+                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s) AND user_id = %s", (picked, uid()))
                 ss.log_ver += 1
                 ss.flash = ("success", f"Marked {len(picked)} shift(s) as paid.")
                 st.rerun()
@@ -1033,7 +1116,7 @@ elif page == PAGES[1]:
                 st.warning("Tick at least one shift first.")
         if b2.button("⏳ Mark selected as unpaid"):
             if picked:
-                run("UPDATE shifts SET paid = FALSE WHERE id = ANY(%s)", (picked,))
+                run("UPDATE shifts SET paid = FALSE WHERE id = ANY(%s) AND user_id = %s", (picked, uid()))
                 ss.log_ver += 1
                 ss.flash = ("success", f"Marked {len(picked)} shift(s) as unpaid.")
                 st.rerun()
@@ -1075,10 +1158,10 @@ elif page == PAGES[1]:
                     hE, mE, gE, _w = compute_shift(e_emp, hrs, e_rate, e_total, e_mil_e, e_tips)
                     run("""UPDATE shifts SET shift_date=%s, employer=%s, start_time=%s, end_time=%s, hourly_rate=%s,
                            hours_worked=%s, hourly_earning=%s, mileage_earning=%s, tips=%s, fuel_cost=%s,
-                           expense_cost=%s, gross_earning=%s, miles=%s, paid=%s WHERE id=%s""",
+                           expense_cost=%s, gross_earning=%s, miles=%s, paid=%s WHERE id=%s AND user_id=%s""",
                         (e_date, e_emp, e_st.strftime("%H:%M"), e_en.strftime("%H:%M"), e_rate, round(hrs, 2),
                          round(hE, 2), round(mE, 2), round(e_tips, 2), round(e_fuel, 2), round(e_exp, 2),
-                         round(gE, 2), round(e_miles, 1), bool(e_paid), int(esel)))
+                         round(gE, 2), round(e_miles, 1), bool(e_paid), int(esel), uid()))
                     ss.flash = ("success", "Shift updated.")
                     st.rerun()
 
@@ -1095,7 +1178,7 @@ elif page == PAGES[1]:
         e2.download_button("📄 Download CSV", export_df.to_csv(index=False).encode(), f"shifts_{TODAY:%Y%m%d}.csv", "text/csv")
 
     def delete_shift():
-        run("DELETE FROM shifts WHERE id = %s", (int(ss.del_sel),))
+        run("DELETE FROM shifts WHERE id = %s AND user_id = %s", (int(ss.del_sel), uid()))
         ss.confirm_del_shift = False  # allowed here: callbacks run before widgets are drawn
         ss.flash = ("success", "Shift deleted.")
 
@@ -1144,8 +1227,8 @@ elif page == PAGES[2]:
         if amt <= 0:
             ss.flash = ("error", "Enter an amount greater than £0.")
             return
-        run("INSERT INTO gogo_transactions (trans_date, trans_type, amount, notes) VALUES (%s,%s,%s,%s)",
-            (ss.trans_date, "RENT" if ss.trans_type == TYPES[1] else "PAYMENT", round(amt, 2), ss.trans_notes.strip()))
+        run("INSERT INTO gogo_transactions (user_id, trans_date, trans_type, amount, notes) VALUES (%s,%s,%s,%s,%s)",
+            (uid(), ss.trans_date, "RENT" if ss.trans_type == TYPES[1] else "PAYMENT", round(amt, 2), ss.trans_notes.strip()))
         ss.trans_amt, ss.trans_notes = 0.0, ""
         ss.flash = ("success", "Transaction added successfully!")
 
@@ -1269,13 +1352,13 @@ elif page == PAGES[2]:
                 t_amt = c1.number_input("Amount (£)", min_value=0.0, value=float(tr["amount"]), step=1.0, format="%.2f", key=kk + "amt")
                 t_notes = c2.text_input("Notes", value=tr["notes"] if isinstance(tr["notes"], str) else "", key=kk + "notes")
                 if st.form_submit_button("Save changes", type="primary"):
-                    run("UPDATE gogo_transactions SET trans_date=%s, trans_type=%s, amount=%s, notes=%s WHERE id=%s",
-                        (t_date, "RENT" if t_type == TYPES[1] else "PAYMENT", round(t_amt, 2), t_notes.strip(), int(tsel)))
+                    run("UPDATE gogo_transactions SET trans_date=%s, trans_type=%s, amount=%s, notes=%s WHERE id=%s AND user_id=%s",
+                        (t_date, "RENT" if t_type == TYPES[1] else "PAYMENT", round(t_amt, 2), t_notes.strip(), int(tsel), uid()))
                     ss.flash = ("success", "Transaction updated.")
                     st.rerun()
 
     def delete_tx():
-        run("DELETE FROM gogo_transactions WHERE id = %s", (int(ss.tx_del_sel),))
+        run("DELETE FROM gogo_transactions WHERE id = %s AND user_id = %s", (int(ss.tx_del_sel), uid()))
         ss.confirm_del_tx = False
         ss.flash = ("success", "Transaction deleted.")
 
@@ -1329,14 +1412,14 @@ elif page == PAGES[3]:
         if c1.button("✅ Mark ticked as paid", type="primary"):
             ids = edited.loc[edited["Paid?"], "id"].astype(int).tolist()
             if ids:
-                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s)", (ids,))
+                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s) AND user_id = %s", (ids, uid()))
                 ss.flash = ("success", f"Marked {len(ids)} shift(s) as paid.")
                 st.rerun()
             else:
                 st.warning("Tick at least one shift first.")
         emp_pick = c2.selectbox("Or mark everything paid for", EMPLOYERS, key="mark_all_emp")
         if c2.button(f"Mark all {emp_pick} as paid"):
-            run("UPDATE shifts SET paid = TRUE WHERE employer = %s AND paid = FALSE", (emp_pick,))
+            run("UPDATE shifts SET paid = TRUE WHERE employer = %s AND paid = FALSE AND user_id = %s", (emp_pick, uid()))
             ss.flash = ("success", f"All {emp_pick} shifts marked as paid.")
             st.rerun()
 
@@ -1662,8 +1745,8 @@ elif page == PAGES[7]:
         base = (ss.fin_notes or "").strip()
         for i in range(reps + 1):
             note = base if reps == 0 else f"{base} (recurring {i + 1}/{reps + 1})".strip()
-            run("INSERT INTO personal_expenses (expense_date, category, amount, notes) VALUES (%s,%s,%s,%s)",
-                (add_months(ss.fin_date, i), ss.fin_cat, round(amt, 2), note))
+            run("INSERT INTO personal_expenses (user_id, expense_date, category, amount, notes) VALUES (%s,%s,%s,%s,%s)",
+                (uid(), add_months(ss.fin_date, i), ss.fin_cat, round(amt, 2), note))
         ss.fin_amt, ss.fin_notes, ss.fin_repeat = 0.0, "", 0
         ss.flash = ("success", f"Added {reps + 1} expense(s) to {ss.fin_cat}." if reps else f"Added {gbp(amt)} to {ss.fin_cat}.")
 
@@ -1847,7 +1930,7 @@ elif page == PAGES[7]:
                 for _, r in edited.iterrows():
                     rid = int(r["id"])
                     if r["Delete"]:
-                        run("DELETE FROM personal_expenses WHERE id = %s", (rid,))
+                        run("DELETE FROM personal_expenses WHERE id = %s AND user_id = %s", (rid, uid()))
                         n_del += 1
                         continue
                     o = orig.loc[rid]
@@ -1859,8 +1942,8 @@ elif page == PAGES[7]:
                     note = r["notes"] if isinstance(r["notes"], str) else ""
                     if (new_date != o["expense_date"] or r["category"] != o["category"]
                             or round(float(amt), 2) != round(float(o["amount"]), 2) or note != o["notes"]):
-                        run("UPDATE personal_expenses SET expense_date=%s, category=%s, amount=%s, notes=%s WHERE id=%s",
-                            (new_date, r["category"], round(float(amt), 2), note.strip(), rid))
+                        run("UPDATE personal_expenses SET expense_date=%s, category=%s, amount=%s, notes=%s WHERE id=%s AND user_id=%s",
+                            (new_date, r["category"], round(float(amt), 2), note.strip(), rid, uid()))
                         n_upd += 1
                 ss.fin_ver += 1
                 msg = f"Saved: {n_upd} updated, {n_del} deleted."
@@ -1871,60 +1954,105 @@ elif page == PAGES[7]:
 # PAGE: SETTINGS & BACKUP
 # ==========================================================
 elif page == PAGES[8]:
-    hero("🛠️ Settings & Backup", "Security, backups and CSV import.")
+    hero("🛠️ Settings & Backup", "Your account, security, backups and CSV import.")
     show_flash()
-    t_sec, t_bak, t_imp = st.tabs(["🔐 Security", "💾 Backup & restore", "📥 Import CSV"])
+    _names = ["🔐 Security", "💾 Backup & restore", "📥 Import CSV"] + (["👥 Users"] if is_admin() else [])
+    _tabs = st.tabs(_names)
+    t_sec, t_bak, t_imp = _tabs[0], _tabs[1], _tabs[2]
+    t_users = _tabs[3] if is_admin() else None
+
+    def my_hash():
+        return str(query_df("SELECT password_hash FROM users WHERE id = %s", (uid(),))["password_hash"].iloc[0])
+
+    def change_password():
+        cur_pw, new_pw, conf = ss.get("pw_cur", ""), ss.get("pw_new", ""), ss.get("pw_conf", "")
+        if not verify_hash(cur_pw, my_hash()):
+            ss.flash = ("error", "Your current password is wrong.")
+        elif len(new_pw) < 8:
+            ss.flash = ("error", "The new password needs at least 8 characters.")
+        elif new_pw != conf:
+            ss.flash = ("error", "The two new passwords don't match.")
+        else:
+            run("UPDATE users SET password_hash = %s WHERE id = %s", (make_password_hash(new_pw), uid()))
+            ss.pw_cur = ss.pw_new = ss.pw_conf = ""
+            ss.flash = ("success", "Password changed.")
+
+    def enable_2fa():
+        secret = ss.get("totp_new")
+        if not secret or not verify_totp(secret, ss.get("totp_test", "")):
+            ss.flash = ("error", "That code doesn't match, so 2FA was not turned on.")
+            return
+        run("UPDATE users SET totp_secret = %s WHERE id = %s", (secret, uid()))
+        ss.pop("totp_new", None)
+        ss.totp_test = ""
+        ss.flash = ("success", "Two-factor login is now ON.")
+
+    def disable_2fa():
+        if not verify_hash(ss.get("tfa_off_pw", ""), my_hash()):
+            ss.flash = ("error", "Wrong password, so 2FA was left on.")
+            return
+        run("UPDATE users SET totp_secret = NULL WHERE id = %s", (uid(),))
+        ss.tfa_off_pw = ""
+        ss.flash = ("success", "Two-factor login is now OFF.")
 
     with t_sec:
+        me = query_df("SELECT totp_secret FROM users WHERE id = %s", (uid(),)).iloc[0]
+        tfa_on = isinstance(me["totp_secret"], str) and bool(me["totp_secret"])
         s1, s2 = st.columns(2)
-        with s1: card("Password", "Hashed" if get_secret("APP_PASSWORD_HASH") else "Plain text", "APP_PASSWORD_HASH" if get_secret("APP_PASSWORD_HASH") else "switch to a hash below", "green" if get_secret("APP_PASSWORD_HASH") else "amber")
-        with s2: card("Two-factor login", "On" if get_secret("APP_TOTP_SECRET") else "Off", "APP_TOTP_SECRET", "green" if get_secret("APP_TOTP_SECRET") else "amber")
-        st.caption(f"Lockout: {MAX_FAILS} failed logins locks sign-in for 15 minutes.")
+        with s1: card("Signed in as", html.escape(ss.user["username"]), f"role: {ss.user['role']}", "indigo")
+        with s2: card("Two-factor login", "On" if tfa_on else "Off", "authenticator app", "green" if tfa_on else "amber")
+        st.caption(f"Lockout: {MAX_FAILS} failed logins for a username blocks sign-in for that username for 15 minutes.")
 
-        st.markdown("#### Generate a password hash")
-        newpw = st.text_input("New password", type="password", key="newpw")
-        if st.button("Generate hash") and newpw:
-            ss.pw_hash = make_password_hash(newpw)
-        if ss.get("pw_hash"):
-            st.code(f'APP_PASSWORD_HASH = "{ss.pw_hash}"', language="toml")
-            st.caption("Paste into your Streamlit secrets and delete `APP_PASSWORD`.")
+        st.markdown("#### Change password")
+        st.text_input("Current password", type="password", key="pw_cur")
+        st.text_input("New password (at least 8 characters)", type="password", key="pw_new")
+        st.text_input("Repeat new password", type="password", key="pw_conf")
+        st.button("Change password", type="primary", on_click=change_password)
 
         st.markdown("#### Two-factor authentication (authenticator app)")
-        if st.button("Generate a new 2FA secret"):
-            ss.totp_new = base64.b32encode(os.urandom(20)).decode()
-        if ss.get("totp_new"):
-            uri = f"otpauth://totp/RotaTracker:{get_secret('APP_USERNAME', 'user')}?secret={ss.totp_new}&issuer=RotaTracker"
-            st.code(f'APP_TOTP_SECRET = "{ss.totp_new}"', language="toml")
-            try:
-                import qrcode
-                img = qrcode.make(uri)
-                buf = io.BytesIO(); img.save(buf, format="PNG")
-                st.image(buf.getvalue(), width=200)
-            except Exception:
-                st.caption("Add this key manually in Google Authenticator / Authy (type: time-based).")
-            test = st.text_input("Enter the 6-digit code from your app to test", key="totp_test")
-            if test:
-                st.success("✅ Code is correct") if verify_totp(ss.totp_new, test) else st.error("Code doesn't match yet")
-            st.caption("Once the test passes, paste the line above into your Streamlit secrets.")
+        if tfa_on:
+            st.success("2FA is on for your account. You'll be asked for a 6-digit code when you sign in.")
+            st.text_input("Enter your password to turn it off", type="password", key="tfa_off_pw")
+            st.button("Turn 2FA off", on_click=disable_2fa)
+        else:
+            if st.button("Set up 2FA"):
+                ss.totp_new = base64.b32encode(os.urandom(20)).decode()
+            if ss.get("totp_new"):
+                uri = f"otpauth://totp/RotaTracker:{ss.user['username']}?secret={ss.totp_new}&issuer=RotaTracker"
+                st.caption("Add this key in Google Authenticator / Microsoft Authenticator / Authy (time-based):")
+                st.code(ss.totp_new)
+                try:
+                    import qrcode
+                    img = qrcode.make(uri)
+                    qbuf = io.BytesIO(); img.save(qbuf, format="PNG")
+                    st.image(qbuf.getvalue(), width=200)
+                except Exception:
+                    pass
+                st.text_input("Type the 6-digit code from your app to confirm", key="totp_test")
+                st.button("Turn 2FA on", type="primary", on_click=enable_2fa)
 
     with t_bak:
-        TABLE_COLS = {
-            "shifts": ["id", "shift_date", "employer", "start_time", "end_time", "hourly_rate", "hours_worked",
-                       "hourly_earning", "mileage_earning", "tips", "fuel_cost", "expense_cost", "gross_earning", "paid", "miles"],
-            "gogo_transactions": ["id", "trans_date", "trans_type", "amount", "notes"],
-            "shift_templates": ["id", "name", "employer", "start_time", "end_time", "hourly_rate"],
-            "personal_expenses": ["id", "expense_date", "category", "amount", "notes"],
-            "app_settings": ["key", "value"],
+        BACKUP_COLS = {
+            "shifts": ["shift_date", "employer", "start_time", "end_time", "hourly_rate", "hours_worked", "hourly_earning",
+                       "mileage_earning", "tips", "fuel_cost", "expense_cost", "gross_earning", "paid", "miles"],
+            "gogo_transactions": ["trans_date", "trans_type", "amount", "notes"],
+            "shift_templates": ["name", "employer", "start_time", "end_time", "hourly_rate"],
+            "personal_expenses": ["expense_date", "category", "amount", "notes"],
         }
-        st.markdown("#### Download a full backup")
+        prefix = f"{uid()}:"
+        st.markdown("#### Download my backup")
+        st.caption("Contains only your own data.")
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for tname in TABLE_COLS:
-                zf.writestr(f"{tname}.csv", query_df(f"SELECT * FROM {tname}").to_csv(index=False))
-        st.download_button("⬇️ Download backup (.zip)", buf.getvalue(), f"rota_backup_{TODAY:%Y%m%d}.zip", "application/zip", type="primary")
+            for tname, cols in BACKUP_COLS.items():
+                zf.writestr(f"{tname}.csv", query_df(f"SELECT {', '.join(cols)} FROM {tname} WHERE user_id = %s ORDER BY id", (uid(),)).to_csv(index=False))
+            sett = query_df("SELECT key, value FROM app_settings WHERE key LIKE %s", (prefix + "%",))
+            sett["key"] = sett["key"].astype(str).str[len(prefix):]
+            zf.writestr("app_settings.csv", sett.to_csv(index=False))
+        st.download_button("⬇️ Download backup (.zip)", buf.getvalue(), f"rota_backup_{ss.user['username']}_{TODAY:%Y%m%d}.zip", "application/zip", type="primary")
 
         st.markdown("#### Restore from a backup")
-        st.warning("Restoring **replaces all current data** with the contents of the backup. Download a fresh backup first.")
+        st.warning("Restoring **replaces all of your current data** with the backup. It never touches other users' data. Download a fresh backup first.")
         up = st.file_uploader("Backup .zip", type="zip", key="restore_zip")
         ok = st.checkbox("I understand this will overwrite my current data", key="restore_ok")
         if st.button("Restore now", disabled=not (up and ok)):
@@ -1932,21 +2060,23 @@ elif page == PAGES[8]:
             conn.autocommit = False
             try:
                 zf = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+                names = zf.namelist()
                 with conn.cursor() as cur:
-                    for tname, allowed in TABLE_COLS.items():
-                        fn = f"{tname}.csv"
-                        if fn not in zf.namelist():
+                    for tname, allowed in BACKUP_COLS.items():
+                        if f"{tname}.csv" not in names:
                             continue
-                        df = pd.read_csv(zf.open(fn))
+                        df = pd.read_csv(zf.open(f"{tname}.csv"))
                         use = [c for c in allowed if c in df.columns]
-                        cur.execute(f"TRUNCATE {tname}")
-                        rows = [tuple(None if pd.isna(v) else (v.item() if hasattr(v, "item") else v) for v in row)
+                        cur.execute(f"DELETE FROM {tname} WHERE user_id = %s", (uid(),))
+                        rows = [(uid(),) + tuple(None if pd.isna(v) else (v.item() if hasattr(v, "item") else v) for v in row)
                                 for row in df[use].itertuples(index=False)]
                         if rows:
-                            cur.executemany(f"INSERT INTO {tname} ({','.join(use)}) VALUES ({','.join(['%s'] * len(use))})", rows)
-                        if "id" in allowed:
-                            cur.execute(f"SELECT setval(pg_get_serial_sequence('{tname}','id'), "
-                                        f"COALESCE((SELECT MAX(id) FROM {tname}),1), (SELECT MAX(id) FROM {tname}) IS NOT NULL)")
+                            cur.executemany(f"INSERT INTO {tname} (user_id, {', '.join(use)}) VALUES (%s, {', '.join(['%s'] * len(use))})", rows)
+                    if "app_settings.csv" in names:
+                        sdf = pd.read_csv(zf.open("app_settings.csv"), dtype=str).fillna("")
+                        cur.execute("DELETE FROM app_settings WHERE key LIKE %s", (prefix + "%",))
+                        for k, v in zip(sdf["key"], sdf["value"]):
+                            cur.execute("INSERT INTO app_settings (key, value) VALUES (%s, %s)", (prefix + k, v))
                 conn.commit()
                 ss.flash = ("success", "Backup restored successfully.")
             except Exception as e:
@@ -1995,3 +2125,122 @@ elif page == PAGES[8]:
                         st.rerun()
             except Exception as e:
                 st.error(f"Could not read the CSV: {e}")
+
+    if t_users is not None and is_admin():
+        USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
+
+        def count_active_admins():
+            return int(query_df("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = TRUE")["n"].iloc[0])
+
+        def admin_reset_pw():
+            if not is_admin():
+                return
+            pw = ss.get("mng_pw", "")
+            if len(pw) < 8:
+                ss.flash = ("error", "The temporary password needs at least 8 characters.")
+                return
+            run("UPDATE users SET password_hash = %s WHERE id = %s", (make_password_hash(pw), int(ss.mng_user)))
+            ss.mng_pw = ""
+            ss.flash = ("success", "Password reset. Tell the user to change it after signing in.")
+
+        def admin_toggle_active():
+            if not is_admin():
+                return
+            tid = int(ss.mng_user)
+            row = query_df("SELECT role, active FROM users WHERE id = %s", (tid,))
+            if row.empty:
+                return
+            if tid == uid():
+                ss.flash = ("error", "You can't disable your own account.")
+            elif bool(row.iloc[0]["active"]) and row.iloc[0]["role"] == "admin" and count_active_admins() <= 1:
+                ss.flash = ("error", "You can't disable the last active admin.")
+            else:
+                run("UPDATE users SET active = %s WHERE id = %s", (not bool(row.iloc[0]["active"]), tid))
+                ss.flash = ("success", "Account updated.")
+
+        def admin_set_role():
+            if not is_admin():
+                return
+            tid = int(ss.mng_user)
+            row = query_df("SELECT role, active FROM users WHERE id = %s", (tid,))
+            if row.empty:
+                return
+            new_role = "user" if row.iloc[0]["role"] == "admin" else "admin"
+            if tid == uid():
+                ss.flash = ("error", "You can't change your own role.")
+            elif new_role == "user" and bool(row.iloc[0]["active"]) and count_active_admins() <= 1:
+                ss.flash = ("error", "There must be at least one active admin.")
+            else:
+                run("UPDATE users SET role = %s WHERE id = %s", (new_role, tid))
+                ss.flash = ("success", f"Role changed to {new_role}.")
+
+        def admin_remove_2fa():
+            if is_admin():
+                run("UPDATE users SET totp_secret = NULL WHERE id = %s", (int(ss.mng_user),))
+                ss.flash = ("success", "2FA removed for that user (they can set it up again).")
+
+        def admin_delete_user():
+            if not is_admin():
+                return
+            tid = int(ss.mng_user)
+            row = query_df("SELECT username, role, active FROM users WHERE id = %s", (tid,))
+            if row.empty:
+                return
+            name = str(row.iloc[0]["username"])
+            if tid == uid():
+                ss.flash = ("error", "You can't delete your own account.")
+            elif (ss.get("mng_del_name", "").strip().lower() != name.lower()):
+                ss.flash = ("error", "Type the username exactly to confirm deletion.")
+            elif row.iloc[0]["role"] == "admin" and bool(row.iloc[0]["active"]) and count_active_admins() <= 1:
+                ss.flash = ("error", "You can't delete the last active admin.")
+            else:
+                for t in OWNED_TABLES:
+                    run(f"DELETE FROM {t} WHERE user_id = %s", (tid,))
+                run("DELETE FROM app_settings WHERE key LIKE %s", (f"{tid}:%",))
+                run("DELETE FROM users WHERE id = %s", (tid,))
+                ss.mng_del_name = ""
+                ss.flash = ("success", f"User “{name}” and all of their data were deleted.")
+
+        with t_users:
+            users_df = query_df("SELECT id, username, role, active, totp_secret, created_at FROM users ORDER BY id")
+            overview = pd.DataFrame({
+                "Username": users_df["username"], "Role": users_df["role"],
+                "Status": users_df["active"].map({True: "🟢 Active", False: "🔴 Disabled"}),
+                "2FA": users_df["totp_secret"].apply(lambda s: "On" if isinstance(s, str) and s else "Off"),
+                "Created": pd.to_datetime(users_df["created_at"]).dt.date})
+            st.caption("Everyone has their own private data. The app never shows one user's shifts, ledger or expenses to another user — admins included. Admins only manage accounts.")
+            show_table(overview, {"Created": st.column_config.DateColumn("Created", format="DD MMM YYYY")})
+
+            st.markdown("#### Add a user")
+            with st.form("add_user_form", clear_on_submit=True):
+                a1, a2 = st.columns(2)
+                nu = a1.text_input("Username (3–30 letters, numbers, . _ -)")
+                npw = a2.text_input("Temporary password (min 8 characters)", type="password")
+                nrole = st.selectbox("Role", ["user", "admin"])
+                if st.form_submit_button("Create user", type="primary"):
+                    nu = nu.strip()
+                    if not USERNAME_RE.match(nu):
+                        st.error("Username must be 3–30 characters: letters, numbers, dot, underscore or dash.")
+                    elif len(npw) < 8:
+                        st.error("The temporary password needs at least 8 characters.")
+                    elif not query_df("SELECT 1 FROM users WHERE LOWER(username) = LOWER(%s)", (nu,)).empty:
+                        st.error("That username is already taken.")
+                    else:
+                        run("INSERT INTO users (username, password_hash, role) VALUES (%s,%s,%s)", (nu, make_password_hash(npw), nrole))
+                        ss.flash = ("success", f"User “{nu}” created. Share the temporary password privately and ask them to change it.")
+                        st.rerun()
+
+            st.markdown("#### Manage a user")
+            ulabels = {int(r.id): f"{r.username} · {r.role}{'' if r.active else ' · disabled'}" for r in users_df.itertuples()}
+            st.selectbox("User", list(ulabels), format_func=ulabels.get, key="mng_user")
+            m1, m2 = st.columns(2, gap="large")
+            with m1:
+                st.text_input("New temporary password", type="password", key="mng_pw")
+                st.button("Reset password", on_click=admin_reset_pw)
+                st.button("Enable / disable account", on_click=admin_toggle_active)
+            with m2:
+                st.button("Switch role (admin ⇄ user)", on_click=admin_set_role)
+                st.button("Remove their 2FA (lost phone)", on_click=admin_remove_2fa)
+            with st.expander("⚠️ Delete this user and ALL of their data"):
+                st.text_input("Type the username to confirm", key="mng_del_name")
+                st.button("Delete user permanently", on_click=admin_delete_user)
