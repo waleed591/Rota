@@ -136,7 +136,11 @@ def today_uk():
 
 
 TODAY = today_uk()
-EMPLOYERS = ["GOGO", "CHINESE", "DANIELLE"]
+EMPLOYERS = []        # active employers (for new shifts) - loaded per user after login
+ALL_EMPLOYERS = []    # active + archived (for history, filters, edit forms)
+EMP_RATES = {}        # default hourly rate per employer
+TOTAL_PAID = set()    # employers paid as one total (mileage is worked out automatically)
+EMP_COLORS = ["#6366f1", "#ef4444", "#14b8a6", "#f59e0b", "#8b5cf6", "#0ea5e9", "#ec4899", "#84cc16"]
 
 
 def gbp(x):
@@ -317,11 +321,16 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS shifts_user_idx ON shifts (user_id)",
     "CREATE INDEX IF NOT EXISTS gogo_user_idx ON gogo_transactions (user_id)",
     "CREATE INDEX IF NOT EXISTS expenses_user_idx ON personal_expenses (user_id)",
+    # ---- employers (per user) ----
+    """CREATE TABLE IF NOT EXISTS employers (
+          id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT NOT NULL, default_rate REAL DEFAULT 0,
+          pay_mode TEXT NOT NULL DEFAULT 'hourly', active BOOLEAN NOT NULL DEFAULT TRUE)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS employers_user_name ON employers (user_id, LOWER(name))",
 ]
-SCHEMA_VERSION = 4  # bump whenever SCHEMA changes so the cached init runs again
+SCHEMA_VERSION = 5  # bump whenever SCHEMA changes so the cached init runs again
 
 
-OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses")
+OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses", "employers")
 
 
 def bootstrap_admin():
@@ -486,6 +495,89 @@ def save_setting(key, value):
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""", (f"{uid()}:{key}", str(value)))
 
 
+# ---------- employers (each user has their own list) ----------
+EMP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &.'-]{1,29}$")
+PAY_MODES = {"hourly": "Hourly rate (mileage & tips added separately)",
+             "total_paid": "Total amount paid (mileage worked out automatically)"}
+
+
+def employer_rate(name):
+    df = query_df("SELECT default_rate FROM employers WHERE user_id = %s AND name = %s", (uid(), name))
+    return float(df["default_rate"].iloc[0]) if not df.empty else 0.0
+
+
+def load_employers():
+    q = "SELECT id, name, default_rate, pay_mode, active FROM employers WHERE user_id = %s ORDER BY id"
+    df = query_df(q, (uid(),))
+    if df.empty:
+        flag = f"{uid()}:employers_seeded"
+        if query_df("SELECT 1 FROM app_settings WHERE key = %s", (flag,)).empty:
+            # Accounts that already have shifts or saved rates keep their original three employers.
+            legacy = (not query_df("SELECT 1 FROM shifts WHERE user_id = %s LIMIT 1", (uid(),)).empty
+                      or not query_df("SELECT 1 FROM app_settings WHERE key LIKE %s LIMIT 1", (f"{uid()}:rate%",)).empty)
+            if legacy:
+                st_ = load_settings()
+                for nm, mode in (("GOGO", "hourly"), ("CHINESE", "total_paid"), ("DANIELLE", "hourly")):
+                    run("INSERT INTO employers (user_id, name, default_rate, pay_mode) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (uid(), nm, float(st_.get(f"rate_{nm}", 0.0)), mode))
+            run("INSERT INTO app_settings (key, value) VALUES (%s, '1') ON CONFLICT (key) DO UPDATE SET value = '1'", (flag,))
+            df = query_df(q, (uid(),))
+    df["default_rate"] = pd.to_numeric(df["default_rate"], errors="coerce").fillna(0.0)
+    df["active"] = df["active"].astype(bool)
+    return df
+
+
+def add_employer(name, rate, mode="hourly", wa=""):
+    """Add an employer with a default hourly rate. Returns (ok, message, cleaned_name)."""
+    name = " ".join(str(name).split()).upper()
+    if not EMP_NAME_RE.match(name):
+        return False, "Use 2–30 characters: letters, numbers, spaces, & . ' or -", name
+    if float(rate) < 0:
+        return False, "The rate can't be negative.", name
+    if mode not in PAY_MODES:
+        mode = "hourly"
+    num = ""
+    if str(wa).strip():
+        num = normalize_phone(wa)
+        if not num:
+            return False, "Couldn't read that WhatsApp number (try 07123 456789 or +44 7123 456789).", name
+    if not query_df("SELECT 1 FROM employers WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid(), name)).empty:
+        return False, f"“{name}” already exists (if it's hidden, restore it in Settings → Employers).", name
+    run("INSERT INTO employers (user_id, name, default_rate, pay_mode) VALUES (%s,%s,%s,%s)",
+        (uid(), name, round(float(rate), 2), mode))
+    if num:
+        save_setting(f"wa_{name}", num)
+    return True, f"Employer “{name}” added with a default rate of £{float(rate):.2f}/hr.", name
+
+
+def render_add_employer(key):
+    ss_ = st.session_state
+    with st.form(f"add_emp_{key}"):
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Employer name", placeholder="e.g. TESCO")
+        rate = c2.number_input("Default hourly rate (£)", min_value=0.0, value=10.0, step=0.10, format="%.2f")
+        mode = st.radio("How does this employer pay you?", list(PAY_MODES), format_func=PAY_MODES.get)
+        wa = st.text_input("WhatsApp number (optional)", placeholder="07… or +44…")
+        submitted = st.form_submit_button("➕ Add employer", type="primary")
+    if submitted:
+        ok, msg, nm = add_employer(name, rate, mode, wa)
+        if ok:
+            ss_.employer_sel = nm            # pre-select the new employer on the rota form
+            ss_.rate_input = float(rate)
+            ss_.flash = ("success", msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+
+def rate_for(name):
+    return float(EMP_RATES.get(name, 0.0))
+
+
+def emp_color(name):
+    return EMP_COLORS[ALL_EMPLOYERS.index(name) % len(EMP_COLORS)] if name in ALL_EMPLOYERS else "#64748b"
+
+
 # ==========================================================
 # DATA LAYER
 # ==========================================================
@@ -537,7 +629,7 @@ def calculate_hours(start_t, end_t):
 def compute_shift(employer, hours, rate, paid_chinese, mileage, tips):
     hourly = hours * rate
     warning = None
-    if employer == "CHINESE":
+    if employer in TOTAL_PAID:
         mileage = paid_chinese - hourly
         if mileage < 0:
             warning = "Total paid is less than the hourly earnings, so mileage was set to £0."
@@ -859,6 +951,11 @@ with nav_box:
     page = st.radio("Navigation", PAGES, horizontal=True, label_visibility="collapsed", key="nav_page")
 
 settings = load_settings()
+_emp_df = load_employers()
+ALL_EMPLOYERS = _emp_df["name"].tolist()
+EMPLOYERS = _emp_df.loc[_emp_df["active"], "name"].tolist()
+EMP_RATES = dict(zip(_emp_df["name"], _emp_df["default_rate"].astype(float)))
+TOTAL_PAID = set(_emp_df.loc[_emp_df["pay_mode"] == "total_paid", "name"])
 try:
     apply_auto_rent(settings)
 except Exception as e:
@@ -873,12 +970,19 @@ if page == PAGES[0]:
     hero("➕ Log a Shift", "Record your hours, tips and expenses in seconds.")
     show_flash()
 
-    ss.setdefault("rate_input", settings["rate_GOGO"])
+    if not EMPLOYERS:
+        st.info("👋 Add your first employer to start logging shifts.")
+        render_add_employer("first")
+        st.stop()
+    if ss.get("employer_sel") not in EMPLOYERS:   # first visit, or the employer was archived
+        ss.employer_sel = EMPLOYERS[0]
+        ss.rate_input = rate_for(EMPLOYERS[0])
+    ss.setdefault("rate_input", rate_for(EMPLOYERS[0]))
     ss.setdefault("start_time_in", time(9, 0))
     ss.setdefault("end_time_in", time(17, 0))
 
     def on_employer_change():
-        ss.rate_input = load_settings()[f"rate_{ss.employer_sel}"]
+        ss.rate_input = employer_rate(ss.employer_sel)
 
     def apply_template():
         row = query_df("SELECT * FROM shift_templates WHERE id = %s AND user_id = %s", (int(ss.tpl_sel), uid()))
@@ -902,17 +1006,22 @@ if page == PAGES[0]:
         ss.tpl_name = ""
         ss.flash = ("success", f"Template “{name}” saved.")
 
-    with st.expander("⚙️ Edit Default Hourly Rates"):
+    with st.expander("⚙️ Employers & default rates"):
+        st.markdown("**Default hourly rates**")
         with st.form("rates_form"):
             rc = st.columns(3)
-            new_rates = {emp: rc[i].number_input(f"{emp} default (£)", min_value=0.0,
-                                                 value=float(settings[f"rate_{emp}"]), step=0.10, format="%.2f")
+            new_rates = {emp: rc[i % 3].number_input(f"{emp} (£)", min_value=0.0, value=rate_for(emp), step=0.10,
+                                                     format="%.2f", key=f"dr_{emp}_{rate_for(emp)}")
                          for i, emp in enumerate(EMPLOYERS)}
             if st.form_submit_button("Save default rates", type="primary"):
                 for emp, val in new_rates.items():
-                    save_setting(f"rate_{emp}", val)
-                ss.rate_input = new_rates[ss.get("employer_sel", "GOGO")]
-                st.success("Default rates saved.")
+                    run("UPDATE employers SET default_rate = %s WHERE user_id = %s AND name = %s", (round(val, 2), uid(), emp))
+                ss.rate_input = new_rates.get(ss.get("employer_sel"), ss.rate_input)
+                ss.flash = ("success", "Default rates saved.")
+                st.rerun()
+        st.markdown("**Add a new employer**")
+        render_add_employer("rota")
+        st.caption("To archive or delete an employer, open Settings → 🏢 Employers.")
 
     templates = load_templates()
     with st.expander("⚡ Templates & copy last week"):
@@ -972,8 +1081,8 @@ if page == PAGES[0]:
         st.subheader("💷 Pay details")
         hourly_rate = st.number_input("Hourly Rate (£)", min_value=0.0, step=0.10, format="%.2f", key="rate_input")
         paid_chinese, mileage_in = 0.0, 0.0
-        if employer == "CHINESE":
-            st.info("💡 **Chinese shift mode:** enter the total paid. Mileage is calculated automatically.")
+        if employer in TOTAL_PAID:
+            st.info("💡 **Total-paid mode:** enter the total amount paid. Mileage is calculated automatically.")
             paid_chinese = st.number_input("Total Amount Paid by Employer (£)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
             tips = st.number_input("Tips Earned (£)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
         else:
@@ -1138,13 +1247,13 @@ elif page == PAGES[1]:
         kk = f"e{esel}_{int(bool(r['paid']))}_"
         with st.form("edit_shift_form"):
             c1, c2 = st.columns(2)
-            e_emp = c1.selectbox("Employer", EMPLOYERS, index=EMPLOYERS.index(r["employer"]) if r["employer"] in EMPLOYERS else 0, key=kk + "emp")
+            e_emp = c1.selectbox("Employer", ALL_EMPLOYERS, index=ALL_EMPLOYERS.index(r["employer"]) if r["employer"] in ALL_EMPLOYERS else 0, key=kk + "emp")
             e_date = c2.date_input("Date", value=r["shift_date"].date(), key=kk + "date")
             e_st = c1.time_input("Start", value=parse_hhmm(r["start_time"]), key=kk + "st")
             e_en = c2.time_input("End", value=parse_hhmm(r["end_time"]), key=kk + "en")
             e_rate = c1.number_input("Hourly rate (£)", min_value=0.0, value=float(r["hourly_rate"]), step=0.10, format="%.2f", key=kk + "rate")
-            e_mil_e = c2.number_input("Mileage earned (£) — not used for CHINESE", min_value=0.0, value=float(r["mileage_earning"]), step=1.0, format="%.2f", key=kk + "me")
-            e_total = c1.number_input("Total paid (£) — CHINESE only", min_value=0.0, value=float(r["hourly_earning"] + r["mileage_earning"]), step=1.0, format="%.2f", key=kk + "tp")
+            e_mil_e = c2.number_input("Mileage earned (£) — ignored for total-paid employers", min_value=0.0, value=float(r["mileage_earning"]), step=1.0, format="%.2f", key=kk + "me")
+            e_total = c1.number_input("Total paid (£) — total-paid employers only", min_value=0.0, value=float(r["hourly_earning"] + r["mileage_earning"]), step=1.0, format="%.2f", key=kk + "tp")
             e_tips = c2.number_input("Tips (£)", min_value=0.0, value=float(r["tips"]), step=1.0, format="%.2f", key=kk + "tips")
             e_fuel = c1.number_input("Fuel (£)", min_value=0.0, value=float(r["fuel_cost"]), step=1.0, format="%.2f", key=kk + "fuel")
             e_exp = c2.number_input("Other expenses (£)", min_value=0.0, value=float(r["expense_cost"]), step=1.0, format="%.2f", key=kk + "exp")
@@ -1382,16 +1491,21 @@ elif page == PAGES[3]:
     gogo_bal = float(settings["gogo_start"]) + (ledger.loc[ledger["Date"].dt.date <= TODAY, "Amount"].sum() if not ledger.empty else 0.0)
 
     unpaid = shifts[~shifts["paid"]] if not shifts.empty else pd.DataFrame()
-    cols = st.columns(len(EMPLOYERS))
-    for i, emp in enumerate(EMPLOYERS):
-        with cols[i]:
-            sub = unpaid[unpaid["employer"] == emp] if not unpaid.empty else unpaid
-            tot = float(sub["hourly_earning"].sum()) if not sub.empty else 0.0
-            if emp == "GOGO":
-                card("GOGO (ledger balance)", gbp(gogo_bal),
-                     f"{len(sub)} shift(s) marked unpaid · {gbp(tot)}", "green" if gogo_bal >= 0 else "red")
-            else:
-                card(emp, gbp(tot), f"{len(sub)} unpaid shift(s)", "amber" if tot > 0 else "slate")
+    if not ALL_EMPLOYERS:
+        st.info("Add an employer on the Enter Rota page first.")
+        st.stop()
+    for _start in range(0, len(ALL_EMPLOYERS), 4):
+        _chunk = ALL_EMPLOYERS[_start:_start + 4]
+        cols = st.columns(len(_chunk))
+        for i, emp in enumerate(_chunk):
+            with cols[i]:
+                sub = unpaid[unpaid["employer"] == emp] if not unpaid.empty else unpaid
+                tot = float(sub["hourly_earning"].sum()) if not sub.empty else 0.0
+                if emp == "GOGO":
+                    card("GOGO (ledger balance)", gbp(gogo_bal),
+                         f"{len(sub)} shift(s) marked unpaid · {gbp(tot)}", "green" if gogo_bal >= 0 else "red")
+                else:
+                    card(emp, gbp(tot), f"{len(sub)} unpaid shift(s)", "amber" if tot > 0 else "slate")
 
     st.markdown("---")
     st.subheader("Unpaid shifts")
@@ -1417,7 +1531,7 @@ elif page == PAGES[3]:
                 st.rerun()
             else:
                 st.warning("Tick at least one shift first.")
-        emp_pick = c2.selectbox("Or mark everything paid for", EMPLOYERS, key="mark_all_emp")
+        emp_pick = c2.selectbox("Or mark everything paid for", ALL_EMPLOYERS, key="mark_all_emp")
         if c2.button(f"Mark all {emp_pick} as paid"):
             run("UPDATE shifts SET paid = TRUE WHERE employer = %s AND paid = FALSE AND user_id = %s", (emp_pick, uid()))
             ss.flash = ("success", f"All {emp_pick} shifts marked as paid.")
@@ -1431,9 +1545,9 @@ elif page == PAGES[3]:
         with st.form("wa_numbers_form"):
             wc = st.columns(3)
             new_nums = {}
-            for i, emp in enumerate(EMPLOYERS):
+            for i, emp in enumerate(ALL_EMPLOYERS):
                 cur = normalize_phone(settings.get(f"wa_{emp}", ""))
-                new_nums[emp] = wc[i].text_input(emp, value=f"+{cur}" if cur else "", placeholder="07… or +44…")
+                new_nums[emp] = wc[i % 3].text_input(emp, value=f"+{cur}" if cur else "", placeholder="07… or +44…")
             if st.form_submit_button("Save numbers", type="primary"):
                 bad = [e for e, v in new_nums.items() if v.strip() and not normalize_phone(v)]
                 if bad:
@@ -1447,7 +1561,7 @@ elif page == PAGES[3]:
         st.info("No shifts recorded yet.")
     else:
         s1, s2, s3 = st.columns(3)
-        st_emp = s1.selectbox("Employer", EMPLOYERS, key="stmt_emp")
+        st_emp = s1.selectbox("Employer", ALL_EMPLOYERS, key="stmt_emp")
         emp_sh = shifts[shifts["employer"] == st_emp]
         if emp_sh.empty:
             st.info(f"No {st_emp} shifts recorded yet.")
@@ -1622,7 +1736,7 @@ elif page == PAGES[5]:
             inner = f'<div class="cal-n">{dn}</div>'
             for it in items:
                 emp = html.escape(str(it.employer))
-                inner += f'<span class="chip {emp}">{emp} {html.escape(str(it.start_time))}-{html.escape(str(it.end_time))}</span>'
+                inner += f'<span class="chip" style="background:{emp_color(it.employer)}">{emp} {html.escape(str(it.start_time))}-{html.escape(str(it.end_time))}</span>'
             if items:
                 inner += f'<div class="cal-t">{gbp(sum(i.gross_earning for i in items))}</div>'
             cells.append(f'<div class="cal-d{" today" if dd == TODAY else ""}">{inner}</div>')
@@ -1670,7 +1784,7 @@ elif page == PAGES[6]:
         years.insert(0, cur_ty)
     f1, f2 = st.columns(2)
     ty = f1.selectbox("Tax year", years, index=years.index(cur_ty), format_func=lambda y: f"{y}/{str(y + 1)[2:]}")
-    incl = f2.multiselect("Employers included (untick any that are PAYE)", EMPLOYERS, default=EMPLOYERS)
+    incl = f2.multiselect("Employers included (untick any that are PAYE)", ALL_EMPLOYERS, default=ALL_EMPLOYERS)
     method = st.radio("Vehicle costs method", ["Actual fuel & expenses", "HMRC mileage allowance + other expenses"], horizontal=True)
 
     s_d, e_d = date(ty, 4, 6), date(ty + 1, 4, 5)
@@ -1956,10 +2070,10 @@ elif page == PAGES[7]:
 elif page == PAGES[8]:
     hero("🛠️ Settings & Backup", "Your account, security, backups and CSV import.")
     show_flash()
-    _names = ["🔐 Security", "💾 Backup & restore", "📥 Import CSV"] + (["👥 Users"] if is_admin() else [])
+    _names = ["🔐 Security", "💾 Backup & restore", "📥 Import CSV", "🏢 Employers"] + (["👥 Users"] if is_admin() else [])
     _tabs = st.tabs(_names)
-    t_sec, t_bak, t_imp = _tabs[0], _tabs[1], _tabs[2]
-    t_users = _tabs[3] if is_admin() else None
+    t_sec, t_bak, t_imp, t_emp = _tabs[0], _tabs[1], _tabs[2], _tabs[3]
+    t_users = _tabs[4] if is_admin() else None
 
     def my_hash():
         return str(query_df("SELECT password_hash FROM users WHERE id = %s", (uid(),))["password_hash"].iloc[0])
@@ -2036,6 +2150,7 @@ elif page == PAGES[8]:
             "shifts": ["shift_date", "employer", "start_time", "end_time", "hourly_rate", "hours_worked", "hourly_earning",
                        "mileage_earning", "tips", "fuel_cost", "expense_cost", "gross_earning", "paid", "miles"],
             "gogo_transactions": ["trans_date", "trans_type", "amount", "notes"],
+            "employers": ["name", "default_rate", "pay_mode", "active"],
             "shift_templates": ["name", "employer", "start_time", "end_time", "hourly_rate"],
             "personal_expenses": ["expense_date", "category", "amount", "notes"],
         }
@@ -2089,9 +2204,9 @@ elif page == PAGES[8]:
     with t_imp:
         st.markdown("#### Import shifts from CSV (adds to existing data)")
         st.caption("Required columns: `shift_date`, `employer`, `start_time`, `end_time`. "
-                   "Optional: `hourly_rate`, `mileage_earning`, `tips`, `fuel_cost`, `expense_cost`, `total_paid` (CHINESE), `miles`, `paid`. "
+                   "Optional: `hourly_rate`, `mileage_earning`, `tips`, `fuel_cost`, `expense_cost`, `total_paid` (for total-paid employers), `miles`, `paid`. "
                    "Dates like 31/10/2026 are read day-first.")
-        sample = pd.DataFrame([{"shift_date": "31/10/2026", "employer": "DANIELLE", "start_time": "09:00", "end_time": "17:00",
+        sample = pd.DataFrame([{"shift_date": "31/10/2026", "employer": (ALL_EMPLOYERS[0] if ALL_EMPLOYERS else "EMPLOYER"), "start_time": "09:00", "end_time": "17:00",
                                 "hourly_rate": 14.0, "mileage_earning": 0, "tips": 5, "fuel_cost": 0, "expense_cost": 0, "miles": 0, "paid": False}])
         st.download_button("Download sample CSV", sample.to_csv(index=False).encode(), "shifts_sample.csv", "text/csv")
         up = st.file_uploader("Shifts CSV", type="csv", key="import_csv")
@@ -2105,7 +2220,7 @@ elif page == PAGES[8]:
                 else:
                     imp["_date"] = pd.to_datetime(imp["shift_date"], dayfirst=True, errors="coerce")
                     imp["employer"] = imp["employer"].astype(str).str.strip().str.upper()
-                    bad = imp[imp["_date"].isna() | ~imp["employer"].isin(EMPLOYERS)]
+                    bad = imp[imp["_date"].isna() | ~imp["employer"].isin(ALL_EMPLOYERS)]
                     good = imp.drop(bad.index)
                     st.write(f"**{len(good)}** valid row(s), **{len(bad)}** skipped (bad date or unknown employer).")
                     show_table(good.drop(columns=["_date"]).head(20))
@@ -2115,7 +2230,7 @@ elif page == PAGES[8]:
                         for _, r in good.iterrows():
                             st_t, en_t = parse_hhmm(r["start_time"]), parse_hhmm(r["end_time"])
                             hrs = calculate_hours(st_t, en_t)
-                            rate = num(r, "hourly_rate") or float(settings[f"rate_{r['employer']}"])
+                            rate = num(r, "hourly_rate") or rate_for(r["employer"])
                             hE, mE, gE, _w = compute_shift(r["employer"], hrs, rate, num(r, "total_paid"), num(r, "mileage_earning"), num(r, "tips"))
                             pd_flag = bool(r["paid"]) if "paid" in imp.columns and pd.notna(r["paid"]) else True
                             insert_shift(r["_date"].date(), r["employer"], st_t.strftime("%H:%M"), en_t.strftime("%H:%M"),
@@ -2125,6 +2240,72 @@ elif page == PAGES[8]:
                         st.rerun()
             except Exception as e:
                 st.error(f"Could not read the CSV: {e}")
+
+    def toggle_employer_active(eid):
+        row = query_df("SELECT name, active FROM employers WHERE id = %s AND user_id = %s", (eid, uid()))
+        if row.empty:
+            return
+        now_active = not bool(row.iloc[0]["active"])
+        run("UPDATE employers SET active = %s WHERE id = %s AND user_id = %s", (now_active, eid, uid()))
+        ss.flash = ("success", f"“{row.iloc[0]['name']}” {'restored' if now_active else 'archived (hidden from new shifts, history kept)'}.")
+
+    def delete_employer(eid):
+        row = query_df("SELECT name FROM employers WHERE id = %s AND user_id = %s", (eid, uid()))
+        if row.empty:
+            return
+        nm = str(row.iloc[0]["name"])
+        n = int(query_df("SELECT COUNT(*) AS n FROM shifts WHERE user_id = %s AND employer = %s", (uid(), nm))["n"].iloc[0])
+        if n > 0:
+            ss.flash = ("error", f"“{nm}” has {n} shift(s). Archive it instead so your history stays intact.")
+        elif not ss.get("emp_del_ok"):
+            ss.flash = ("error", "Tick the confirmation box first.")
+        else:
+            run("DELETE FROM employers WHERE id = %s AND user_id = %s", (eid, uid()))
+            run("DELETE FROM shift_templates WHERE user_id = %s AND employer = %s", (uid(), nm))
+            run("DELETE FROM app_settings WHERE key = %s", (f"{uid()}:wa_{nm}",))
+            ss.emp_del_ok = False
+            ss.flash = ("success", f"“{nm}” deleted.")
+
+    with t_emp:
+        edf = load_employers()
+        cnt_df = query_df("SELECT employer, COUNT(*) AS n FROM shifts WHERE user_id = %s GROUP BY employer", (uid(),))
+        cmap = dict(zip(cnt_df["employer"], cnt_df["n"]))
+        if edf.empty:
+            st.info("You haven't added any employers yet.")
+        else:
+            overview = pd.DataFrame({
+                "Employer": edf["name"], "Rate": edf["default_rate"],
+                "Pay type": edf["pay_mode"].map({"hourly": "Hourly + extras", "total_paid": "Total paid"}),
+                "Status": edf["active"].map({True: "🟢 Active", False: "📦 Archived"}),
+                "Shifts": [int(cmap.get(n, 0)) for n in edf["name"]]})
+            show_table(overview, {"Rate": st.column_config.NumberColumn("Default rate (£/hr)", format="%.2f")})
+
+        st.markdown("#### Add a new employer")
+        render_add_employer("settings")
+
+        if not edf.empty:
+            st.markdown("#### Edit an employer")
+            elabels = {int(r.id): f"{r.name}{'' if r.active else ' (archived)'}" for r in edf.itertuples()}
+            esel2 = st.selectbox("Employer", list(elabels), format_func=elabels.get, key="emp_edit_sel")
+            erow = edf[edf["id"] == esel2].iloc[0]
+            ek = f"emp{esel2}_{erow['default_rate']}_{erow['pay_mode']}_"
+            with st.form("edit_employer_form"):
+                new_rate = st.number_input("Default hourly rate (£)", min_value=0.0, value=float(erow["default_rate"]),
+                                           step=0.10, format="%.2f", key=ek + "rate")
+                modes = list(PAY_MODES)
+                new_mode = st.radio("How does this employer pay you?", modes, index=modes.index(erow["pay_mode"]) if erow["pay_mode"] in modes else 0,
+                                    format_func=PAY_MODES.get, key=ek + "mode")
+                if st.form_submit_button("Save changes", type="primary"):
+                    run("UPDATE employers SET default_rate = %s, pay_mode = %s WHERE id = %s AND user_id = %s",
+                        (round(new_rate, 2), new_mode, int(esel2), uid()))
+                    ss.flash = ("success", "Employer updated. Past shifts keep the values they were saved with.")
+                    st.rerun()
+            b1, b2 = st.columns(2)
+            b1.button("Restore employer" if not erow["active"] else "Archive employer", on_click=toggle_employer_active, args=(int(esel2),))
+            with st.expander("⚠️ Delete this employer"):
+                st.caption("Only possible when the employer has no shifts. Otherwise archive it.")
+                st.checkbox("Yes, delete this employer", key="emp_del_ok")
+                st.button("Delete employer", on_click=delete_employer, args=(int(esel2),))
 
     if t_users is not None and is_admin():
         USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
