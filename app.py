@@ -1,4 +1,5 @@
-import base64
+from types import SimpleNamespace
+from trading_journal import SCHEMA as TJ_SCHEMA, BACKUP_COLS as TJ_BACKUP, render as render_trading_journalimport base64
 import calendar
 import hashlib
 import hmac
@@ -327,10 +328,11 @@ SCHEMA = [
           pay_mode TEXT NOT NULL DEFAULT 'hourly', active BOOLEAN NOT NULL DEFAULT TRUE)""",
     "CREATE UNIQUE INDEX IF NOT EXISTS employers_user_name ON employers (user_id, LOWER(name))",
 ]
-SCHEMA_VERSION = 5  # bump whenever SCHEMA changes so the cached init runs again
+SCHEMA += TJ_SCHEMA
+SCHEMA_VERSION = 6  # bump whenever SCHEMA changes so the cached init runs again
 
 
-OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses", "employers")
+OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses", "employers" "trading_journal")
 
 
 def bootstrap_admin():
@@ -467,7 +469,7 @@ SETTING_DEFAULTS = {
     "tax_pa": "12570", "tax_basic_upper": "50270", "tax_add_threshold": "125140",
     "tax_basic_rate": "20", "tax_higher_rate": "40", "tax_add_rate": "45",
     "ni_lower": "12570", "ni_upper": "50270", "ni_main": "6", "ni_top": "2",
-    "mile_rate_1": "0.45", "mile_rate_2": "0.25", "mile_threshold": "10000",
+    "mile_rate_1": "0.45", "mile_rate_2": "0.25", "mile_threshold": "10000", "tj_capital": "10000",
 }
 
 
@@ -931,7 +933,7 @@ def est_class4_ni(profit, s):
 # SIDEBAR / NAV
 # ==========================================================
 PAGES = ["➕ Enter Rota", "📊 History & Earnings", "🏠 GOGO Ledger", "💼 Unpaid & Owed",
-         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "💰 Personal Finance & Expenses", "🛠️ Settings & Backup"]
+         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "💰 Personal Finance & Expenses", "📈 Trading Journal" "🛠️ Settings & Backup"]
 
 bar_l, bar_r = st.columns([5, 1])
 with bar_l:
