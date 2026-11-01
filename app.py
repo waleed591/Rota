@@ -1,5 +1,4 @@
-from types import SimpleNamespace
-from trading_journal import SCHEMA as TJ_SCHEMA, BACKUP_COLS as TJ_BACKUP, render as render_trading_journalimport base64
+import base64
 import calendar
 import hashlib
 import hmac
@@ -13,10 +12,13 @@ import struct
 import time as time_mod
 import zipfile
 from datetime import date, datetime, time, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import psycopg2
 import streamlit as st
+
+from trading_journal import SCHEMA as TJ_SCHEMA, BACKUP_COLS as TJ_BACKUP, render as render_trading_journal
 
 # ==========================================================
 # PAGE CONFIG
@@ -328,11 +330,11 @@ SCHEMA = [
           pay_mode TEXT NOT NULL DEFAULT 'hourly', active BOOLEAN NOT NULL DEFAULT TRUE)""",
     "CREATE UNIQUE INDEX IF NOT EXISTS employers_user_name ON employers (user_id, LOWER(name))",
 ]
-SCHEMA += TJ_SCHEMA
-SCHEMA_VERSION = 6  # bump whenever SCHEMA changes so the cached init runs again
+SCHEMA += TJ_SCHEMA     # trading journal table (defined in trading_journal.py)
+SCHEMA_VERSION = 6      # bump whenever SCHEMA changes so the cached init runs again
 
 
-OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses", "employers" "trading_journal")
+OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses", "employers", "trading_journal")
 
 
 def bootstrap_admin():
@@ -469,7 +471,9 @@ SETTING_DEFAULTS = {
     "tax_pa": "12570", "tax_basic_upper": "50270", "tax_add_threshold": "125140",
     "tax_basic_rate": "20", "tax_higher_rate": "40", "tax_add_rate": "45",
     "ni_lower": "12570", "ni_upper": "50270", "ni_main": "6", "ni_top": "2",
-    "mile_rate_1": "0.45", "mile_rate_2": "0.25", "mile_threshold": "10000", "tj_capital": "10000",
+    "mile_rate_1": "0.45", "mile_rate_2": "0.25", "mile_threshold": "10000",
+    # trading journal
+    "tj_capital": "10000",
 }
 
 
@@ -933,7 +937,8 @@ def est_class4_ni(profit, s):
 # SIDEBAR / NAV
 # ==========================================================
 PAGES = ["➕ Enter Rota", "📊 History & Earnings", "🏠 GOGO Ledger", "💼 Unpaid & Owed",
-         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "💰 Personal Finance & Expenses", "📈 Trading Journal" "🛠️ Settings & Backup"]
+         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "💰 Personal Finance & Expenses",
+         "📈 Trading Journal", "🛠️ Settings & Backup"]
 
 bar_l, bar_r = st.columns([5, 1])
 with bar_l:
@@ -2067,9 +2072,18 @@ elif page == PAGES[7]:
                 st.rerun()
 
 # ==========================================================
-# PAGE: SETTINGS & BACKUP
+# PAGE: TRADING JOURNAL  (logic lives in trading_journal.py)
 # ==========================================================
 elif page == PAGES[8]:
+    render_trading_journal(SimpleNamespace(
+        uid=uid, run=run, query_df=query_df, hero=hero, card=card, show_table=show_table,
+        gbp=gbp, show_flash=show_flash, today=TODAY, settings=settings,
+        save_setting=save_setting, to_excel_bytes=to_excel_bytes))
+
+# ==========================================================
+# PAGE: SETTINGS & BACKUP
+# ==========================================================
+elif page == PAGES[9]:
     hero("🛠️ Settings & Backup", "Your account, security, backups and CSV import.")
     show_flash()
     _names = ["🔐 Security", "💾 Backup & restore", "📥 Import CSV", "🏢 Employers"] + (["👥 Users"] if is_admin() else [])
@@ -2155,6 +2169,7 @@ elif page == PAGES[8]:
             "employers": ["name", "default_rate", "pay_mode", "active"],
             "shift_templates": ["name", "employer", "start_time", "end_time", "hourly_rate"],
             "personal_expenses": ["expense_date", "category", "amount", "notes"],
+            "trading_journal": TJ_BACKUP,
         }
         prefix = f"{uid()}:"
         st.markdown("#### Download my backup")
