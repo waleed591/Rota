@@ -1,241 +1,1736 @@
-"""Trading Journal section for Rota Tracker.
-
-Drop this file next to your main app file. It adds one new page with its own
-Postgres table (trading_journal), scoped to the logged-in user via user_id,
-and uses the same cards, hero and styling helpers as the rest of the app.
-No new dependencies (native Streamlit charts only).
-"""
+import base64
 import calendar
+import hashlib
+import hmac
 import html
 import io
-import math
-from datetime import date
+import json
+import os
+import re
+import secrets as pysecrets
+import struct
+import time as time_mod
+import zipfile
+from datetime import date, datetime, time, timedelta
+from types import SimpleNamespace
 
-import numpy as np
 import pandas as pd
+import psycopg2
 import streamlit as st
 
-MOODS = ["Calm", "Confident", "Anxious", "Impulsive", "Revenge", "Bored", "Tired"]
-FIELDS = ["trade_date", "symbol", "side", "entry_price", "exit_price", "qty", "stop_price", "fees",
-          "multiplier", "setup", "mood", "rating", "tags", "notes"]
-NUM = ["entry_price", "exit_price", "qty", "stop_price", "fees", "multiplier"]
+from trading_journal import SCHEMA as TJ_SCHEMA, BACKUP_COLS as TJ_BACKUP, render as render_trading_journal
 
-# Imported by the main app: table definition and the columns included in backups.
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
+st.set_page_config(page_title="Rota Earnings Tracker", page_icon="💷", layout="wide")
+
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+.stApp, .stApp :is(h1,h2,h3,h4,p,label,input,textarea,button,li,td,th) {
+    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+}
+.stApp {
+    background:
+        radial-gradient(1100px 560px at 8% -10%, rgba(99,102,241,.16), transparent 60%),
+        radial-gradient(900px 500px at 100% 0%, rgba(20,184,166,.13), transparent 55%);
+}
+.block-container { padding-top: 2.2rem; max-width: 1250px; }
+#MainMenu, footer, [data-testid="stToolbarActions"], [data-testid="stMainMenu"], .stAppDeployButton,
+[data-testid="stDecoration"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent; }
+
+.hero { padding: 26px 30px; border-radius: 20px; margin-bottom: 22px; color: #fff;
+    background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 55%, #0ea5e9 100%);
+    box-shadow: 0 12px 32px rgba(79,70,229,.35); }
+.hero-title { font-size: 1.9rem; font-weight: 800; letter-spacing: -.02em; line-height: 1.2; }
+.hero-sub { opacity: .88; margin-top: 4px; font-size: .98rem; }
+
+.card { position: relative; overflow: hidden; height: 100%; padding: 16px 18px 14px 22px; margin-bottom: 12px;
+    border-radius: 16px; border: 1px solid rgba(128,128,128,.22); background: rgba(128,128,128,.07);
+    box-shadow: 0 4px 18px rgba(0,0,0,.06); transition: transform .15s ease, box-shadow .15s ease; }
+.card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.10); }
+.card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 6px; background: var(--accent); }
+.card.indigo { --accent: linear-gradient(180deg,#6366f1,#8b5cf6); }
+.card.green  { --accent: linear-gradient(180deg,#10b981,#34d399); }
+.card.red    { --accent: linear-gradient(180deg,#ef4444,#f97316); }
+.card.amber  { --accent: linear-gradient(180deg,#f59e0b,#fbbf24); }
+.card.teal   { --accent: linear-gradient(180deg,#14b8a6,#0ea5e9); }
+.card.slate  { --accent: linear-gradient(180deg,#64748b,#94a3b8); }
+.card-label { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; opacity: .7; font-weight: 600; }
+.card-value { font-size: 1.65rem; font-weight: 800; line-height: 1.25; margin-top: 4px; }
+.card-sub   { font-size: .78rem; opacity: .65; margin-top: 2px; }
+
+.bar { height: 12px; border-radius: 99px; background: rgba(128,128,128,.22); overflow: hidden; margin: 8px 0 4px; }
+.bar > div { height: 100%; border-radius: 99px; background: linear-gradient(90deg,#6366f1,#14b8a6); }
+.bar.done > div { background: linear-gradient(90deg,#10b981,#34d399); }
+
+.balance { padding: 22px 28px; border-radius: 20px; color: #fff; margin: 6px 0 18px 0; display: flex;
+    justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; box-shadow: 0 12px 30px rgba(0,0,0,.18); }
+.balance.owed { background: linear-gradient(120deg,#059669,#10b981 60%,#2dd4bf); }
+.balance.owe  { background: linear-gradient(120deg,#dc2626,#f97316); }
+.balance .b-label { font-size: .8rem; text-transform: uppercase; letter-spacing: .1em; opacity: .9; font-weight: 600; }
+.balance .b-value { font-size: 2.3rem; font-weight: 800; letter-spacing: -.02em; }
+
+.cal-wrap { overflow-x: auto; }
+.cal { display: grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap: 6px; min-width: 720px; }
+.cal-h { text-align: center; font-weight: 700; font-size: .78rem; opacity: .7; padding: 4px 0; }
+.cal-d { min-height: 98px; padding: 6px 7px; border-radius: 12px; font-size: .72rem;
+    border: 1px solid rgba(128,128,128,.2); background: rgba(128,128,128,.06); }
+.cal-d.empty { background: transparent; border-color: transparent; }
+.cal-d.today { border: 2px solid #6366f1; }
+.cal-n { font-weight: 700; font-size: .8rem; opacity: .8; }
+.chip { display: block; margin-top: 3px; padding: 2px 6px; border-radius: 7px; color: #fff; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #64748b; }
+.chip.GOGO { background: #6366f1; } .chip.CHINESE { background: #ef4444; } .chip.DANIELLE { background: #14b8a6; }
+.cal-t { margin-top: 4px; font-weight: 700; opacity: .75; }
+
+[data-testid="stSidebar"] { border-right: 1px solid rgba(128,128,128,.2); }
+.brand { font-size: 1.3rem; font-weight: 800; padding: 6px 0 14px 0; letter-spacing: -.01em; }
+[data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] { border-radius: 12px !important; }
+button[data-testid="stBaseButton-primary"], button[data-testid="stBaseButton-primaryFormSubmit"],
+button[kind="primary"], button[kind="primaryFormSubmit"] {
+    background: linear-gradient(120deg,#4f46e5,#7c3aed) !important; border: none !important; color: #fff !important;
+    font-weight: 600; border-radius: 12px !important; padding: .55rem 1.3rem; box-shadow: 0 6px 18px rgba(79,70,229,.35); }
+button[data-testid^="stBaseButton-secondary"] { border-radius: 12px !important; font-weight: 600; }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; }
+.stTabs [data-baseweb="tab"] { border-radius: 10px 10px 0 0; padding: 8px 18px; font-weight: 600; }
+[data-testid="stExpander"] { border-radius: 14px; border: 1px solid rgba(128,128,128,.25); background: rgba(128,128,128,.05); }
+[data-testid="stDataFrame"] { border-radius: 14px; overflow: hidden; border: 1px solid rgba(128,128,128,.2); }
+h2, h3 { letter-spacing: -.01em; font-weight: 700 !important; }
+a[data-testid="stBaseLinkButton-primary"] { background: linear-gradient(120deg,#16a34a,#22c55e) !important;
+    border: none !important; color: #fff !important; border-radius: 12px !important; font-weight: 600;
+    box-shadow: 0 6px 18px rgba(34,197,94,.35); }
+
+/* Top navigation (works on phones, tablets and desktops) */
+.st-key-nav [role="radiogroup"] { flex-wrap: wrap; gap: 8px; }
+.st-key-nav label[data-baseweb="radio"] { margin: 0; padding: 8px 14px; border-radius: 999px; cursor: pointer;
+    border: 1px solid rgba(128,128,128,.3); background: rgba(128,128,128,.08); transition: all .15s ease; }
+.st-key-nav label[data-baseweb="radio"] > div:first-child { display: none; }
+.st-key-nav label[data-baseweb="radio"] p { font-weight: 600; font-size: .88rem; white-space: nowrap; }
+.st-key-nav label[data-baseweb="radio"]:has(input:checked) {
+    background: linear-gradient(120deg,#4f46e5,#7c3aed); border-color: transparent; box-shadow: 0 6px 16px rgba(79,70,229,.35); }
+.st-key-nav label[data-baseweb="radio"]:has(input:checked) p { color: #fff; }
+
+@media (max-width: 640px) {
+    .block-container { padding-left: 1rem; padding-right: 1rem; padding-top: 1.2rem; }
+    .hero { padding: 18px 20px; border-radius: 16px; }
+    .hero-title { font-size: 1.4rem; }
+    .card-value { font-size: 1.35rem; }
+    .balance .b-value { font-size: 1.8rem; }
+    .st-key-nav label[data-baseweb="radio"] { padding: 6px 11px; }
+    .st-key-nav label[data-baseweb="radio"] p { font-size: .8rem; }
+}
+</style>
+"""
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+
+# ==========================================================
+# GENERIC HELPERS
+# ==========================================================
+def today_uk():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/London")).date()
+    except Exception:
+        return date.today()
+
+
+TODAY = today_uk()
+EMPLOYERS = []        # active employers (for new shifts) - loaded per user after login
+ALL_EMPLOYERS = []    # active + archived (for history, filters, edit forms)
+EMP_RATES = {}        # default hourly rate per employer
+TOTAL_PAID = set()    # employers paid as one total (mileage is worked out automatically)
+EMP_COLORS = ["#6366f1", "#ef4444", "#14b8a6", "#f59e0b", "#8b5cf6", "#0ea5e9", "#ec4899", "#84cc16"]
+
+
+def gbp(x):
+    x = float(x or 0)
+    return f"-£{abs(x):,.2f}" if x < 0 else f"£{x:,.2f}"
+
+
+def hero(title, subtitle=""):
+    st.markdown(f'<div class="hero"><div class="hero-title">{title}</div>'
+                f'<div class="hero-sub">{subtitle}</div></div>', unsafe_allow_html=True)
+
+
+def card(label, value, sub="", tone="indigo"):
+    st.markdown(f'<div class="card {tone}"><div class="card-label">{label}</div>'
+                f'<div class="card-value">{value}</div><div class="card-sub">{sub}</div></div>',
+                unsafe_allow_html=True)
+
+
+def progress_card(label, value, target, tone="indigo"):
+    pct = min(100.0, value / target * 100) if target > 0 else 0.0
+    done = "done" if target > 0 and value >= target else ""
+    sub = f"{pct:.0f}% of {gbp(target)}" if target > 0 else "No target set"
+    st.markdown(
+        f'<div class="card {tone}"><div class="card-label">{label}</div>'
+        f'<div class="card-value">{gbp(value)}</div>'
+        f'<div class="bar {done}"><div style="width:{pct:.0f}%"></div></div>'
+        f'<div class="card-sub">{sub}</div></div>', unsafe_allow_html=True)
+
+
+def show_table(df, column_config=None):
+    try:
+        st.dataframe(df, width="stretch", hide_index=True, column_config=column_config)
+    except Exception:
+        st.dataframe(df, use_container_width=True, hide_index=True, column_config=column_config)
+
+
+def get_secret(key, default=None):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, default)
+
+
+def parse_hhmm(s):
+    try:
+        return datetime.strptime(str(s)[:5].strip(), "%H:%M").time()
+    except Exception:
+        return time(9, 0)
+
+
+def to_excel_bytes(sheets):
+    """Dict of {sheet_name: DataFrame} -> xlsx bytes (None if openpyxl is missing)."""
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            for name, df in sheets.items():
+                df.to_excel(writer, sheet_name=name[:31], index=False)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def show_flash():
+    if "flash" in st.session_state:
+        level, msg = st.session_state.pop("flash")
+        getattr(st, level)(msg)
+
+
+# ---------- security helpers ----------
+def make_password_hash(pw, iters=200_000):
+    salt = pysecrets.token_hex(8)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), iters).hex()
+    return f"pbkdf2_sha256${iters}${salt}${digest}"
+
+
+def verify_hash(pw, stored):
+    try:
+        _, iters, salt, digest = str(stored).split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), int(iters)).hex()
+        return hmac.compare_digest(calc, digest)
+    except Exception:
+        return False
+
+
+def totp_now(secret, t=None, step=30, digits=6):
+    s = secret.replace(" ", "").upper()
+    s += "=" * ((8 - len(s) % 8) % 8)
+    key = base64.b32decode(s)
+    counter = int((time_mod.time() if t is None else t) // step)
+    h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def verify_totp(secret, code):
+    code = (code or "").strip().replace(" ", "")
+    now = time_mod.time()
+    return any(hmac.compare_digest(totp_now(secret, now + d * 30), code) for d in (-1, 0, 1))
+
+
+def uid():
+    """Id of the logged-in user. Every query is filtered by this, so users only ever see their own data."""
+    return int(st.session_state.user["id"])
+
+
+def is_admin():
+    return bool(st.session_state.get("user")) and st.session_state.user.get("role") == "admin"
+
+
+# ==========================================================
+# DATABASE
+# ==========================================================
+DATABASE_URL = get_secret("DATABASE_URL")
+if not DATABASE_URL:
+    st.error("⚠️ Database URL not configured.")
+    st.stop()
+
+
+@st.cache_resource(show_spinner=False)
+def _connect(url):
+    conn = psycopg2.connect(url, connect_timeout=10)
+    conn.autocommit = True
+    return conn
+
+
+def get_conn():
+    conn = _connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        _connect.clear()
+        conn = _connect(DATABASE_URL)
+    return conn
+
+
+def run(sql, params=None):
+    with get_conn().cursor() as cur:
+        cur.execute(sql, params)
+        return cur.rowcount
+
+
+def query_df(sql, params=None):
+    with get_conn().cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+
 SCHEMA = [
-    """CREATE TABLE IF NOT EXISTS trading_journal (
-          id SERIAL PRIMARY KEY, user_id INTEGER, trade_date DATE, symbol TEXT, side TEXT,
-          entry_price DOUBLE PRECISION, exit_price DOUBLE PRECISION, qty DOUBLE PRECISION,
-          stop_price DOUBLE PRECISION, fees DOUBLE PRECISION, multiplier DOUBLE PRECISION,
-          setup TEXT, mood TEXT, rating INTEGER, tags TEXT, notes TEXT)""",
-    "CREATE INDEX IF NOT EXISTS trading_journal_user_idx ON trading_journal (user_id)",
-    """CREATE TABLE IF NOT EXISTS trading_journal_shots (
-          id SERIAL PRIMARY KEY, user_id INTEGER, trade_id INTEGER, filename TEXT, mime TEXT,
-          data BYTEA, created_at TIMESTAMP DEFAULT NOW())""",
-    "CREATE INDEX IF NOT EXISTS trading_journal_shots_idx ON trading_journal_shots (user_id, trade_id)",
+    """CREATE TABLE IF NOT EXISTS shifts (
+          id SERIAL PRIMARY KEY, shift_date DATE, employer TEXT, start_time TEXT, end_time TEXT,
+          hourly_rate REAL, hours_worked REAL, hourly_earning REAL, mileage_earning REAL, tips REAL,
+          fuel_cost REAL, expense_cost REAL, gross_earning REAL)""",
+    "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT TRUE",   # old shifts count as paid
+    "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS miles REAL DEFAULT 0",
+    """CREATE TABLE IF NOT EXISTS gogo_transactions (
+          id SERIAL PRIMARY KEY, trans_date DATE, trans_type TEXT, amount REAL, notes TEXT)""",
+    "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)",
+    """CREATE TABLE IF NOT EXISTS shift_templates (
+          id SERIAL PRIMARY KEY, name TEXT, employer TEXT, start_time TEXT, end_time TEXT, hourly_rate REAL)""",
+    "CREATE TABLE IF NOT EXISTS login_attempts (id SERIAL PRIMARY KEY, ts TIMESTAMP DEFAULT NOW(), ok BOOLEAN)",
+    """CREATE TABLE IF NOT EXISTS personal_expenses (
+          id SERIAL PRIMARY KEY, expense_date DATE, category TEXT, amount NUMERIC(10,2), notes TEXT)""",
+    # ---- multi-user ----
+    """CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'user', totp_secret TEXT, active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT NOW())""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (LOWER(username))",
+    "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE gogo_transactions ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE shift_templates ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE personal_expenses ADD COLUMN IF NOT EXISTS user_id INTEGER",
+    "ALTER TABLE login_attempts ADD COLUMN IF NOT EXISTS username TEXT",
+    "CREATE INDEX IF NOT EXISTS shifts_user_idx ON shifts (user_id)",
+    "CREATE INDEX IF NOT EXISTS gogo_user_idx ON gogo_transactions (user_id)",
+    "CREATE INDEX IF NOT EXISTS expenses_user_idx ON personal_expenses (user_id)",
+    # ---- employers (per user) ----
+    """CREATE TABLE IF NOT EXISTS employers (
+          id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT NOT NULL, default_rate REAL DEFAULT 0,
+          pay_mode TEXT NOT NULL DEFAULT 'hourly', active BOOLEAN NOT NULL DEFAULT TRUE)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS employers_user_name ON employers (user_id, LOWER(name))",
 ]
-BACKUP_COLS = FIELDS
+SCHEMA += TJ_SCHEMA     # trading journal table (defined in trading_journal.py)
+SCHEMA_VERSION = 7      # bump whenever SCHEMA changes so the cached init runs again
 
 
-# ---------- calculations ----------
-def calc_net(side, entry, exit_, qty, mult, fees):
-    sign = 1 if side == "Long" else -1
-    return (exit_ - entry) * sign * qty * mult - fees
+OWNED_TABLES = ("shifts", "gogo_transactions", "shift_templates", "personal_expenses", "employers", "trading_journal", "trading_journal_shots")
 
 
-def load_trades(a):
-    df = a.query_df("SELECT * FROM trading_journal WHERE user_id = %s", (a.uid(),)).drop(columns=["user_id"], errors="ignore")
+def bootstrap_admin():
+    """First start after upgrading: create the admin from the old secrets and give all existing data to them.
+    Set APP_RESET_ADMIN = "true" in the secrets (temporarily) to force-reset that admin's password / 2FA."""
+    uname = get_secret("APP_USERNAME")
+    pw_hash, plain = get_secret("APP_PASSWORD_HASH"), get_secret("APP_PASSWORD")
+    if uname and (pw_hash or plain):
+        n = int(query_df("SELECT COUNT(*) AS n FROM users")["n"].iloc[0])
+        reset = str(get_secret("APP_RESET_ADMIN", "")).strip().lower() in ("1", "true", "yes")
+        if n == 0 or reset:
+            stored = str(pw_hash) if pw_hash else make_password_hash(str(plain))
+            totp = get_secret("APP_TOTP_SECRET") or None
+            name = str(uname).strip()
+            hit = 0
+            if n > 0:
+                hit = run("UPDATE users SET password_hash=%s, totp_secret=%s, role='admin', active=TRUE "
+                          "WHERE LOWER(username)=LOWER(%s)", (stored, totp, name))
+            if not hit:
+                run("INSERT INTO users (username, password_hash, role, totp_secret) VALUES (%s,%s,'admin',%s)",
+                    (name, stored, totp))
+    admin = query_df("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+    if admin.empty:
+        return
+    aid = int(admin["id"].iloc[0])
+    for t in OWNED_TABLES:                      # data from before multi-user belongs to the first admin
+        run(f"UPDATE {t} SET user_id = %s WHERE user_id IS NULL", (aid,))
+    run("DELETE FROM app_settings a WHERE POSITION(':' IN a.key) = 0 AND "
+        "EXISTS (SELECT 1 FROM app_settings b WHERE b.key = %s || ':' || a.key)", (str(aid),))
+    run("UPDATE app_settings SET key = %s || ':' || key WHERE POSITION(':' IN key) = 0", (str(aid),))
+
+
+@st.cache_resource(show_spinner=False)
+def init_schema(url, version):
+    for stmt in SCHEMA:
+        run(stmt)
+    bootstrap_admin()
+    return True
+
+
+try:
+    init_schema(DATABASE_URL, SCHEMA_VERSION)
+    DB_ERROR = None
+except Exception as e:
+    DB_ERROR = str(e)
+
+# ==========================================================
+# AUTHENTICATION  (database users, per-user 2FA, per-username lockout)
+# ==========================================================
+MAX_FAILS = 5
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.user = None
+
+if not st.session_state.authenticated:
+    _, mid, _ = st.columns([1, 1.3, 1])
+    with mid:
+        st.markdown("<div style='height:7vh'></div>", unsafe_allow_html=True)
+        hero("🔒 Rota Tracker", "Sign in to view your shifts and earnings.")
+
+        if DB_ERROR:
+            st.error("⚠️ Database connection failed.")
+        else:
+            try:
+                n_users = int(query_df("SELECT COUNT(*) AS n FROM users")["n"].iloc[0])
+            except Exception:
+                n_users = -1
+            if n_users == 0:
+                st.error("No accounts exist yet. Add `APP_USERNAME` and `APP_PASSWORD` (or `APP_PASSWORD_HASH`) "
+                         "to your Streamlit secrets and restart the app. The first admin account is created from them.")
+            else:
+                with st.form("login_form"):
+                    username = st.text_input("Username", placeholder="Enter your username")
+                    password = st.text_input("Password", type="password", placeholder="Enter your password")
+                    code = st.text_input("2FA code", placeholder="Only if you turned 2FA on")
+                    submitted = st.form_submit_button("Sign in", type="primary")
+
+                if submitted:
+                    uname = username.strip()
+                    fails = int(query_df("SELECT COUNT(*) AS n FROM login_attempts WHERE ok = FALSE "
+                                         "AND LOWER(COALESCE(username,'')) = LOWER(%s) "
+                                         "AND ts > NOW() - INTERVAL '15 minutes'", (uname,))["n"].iloc[0])
+                    all_fails = int(query_df("SELECT COUNT(*) AS n FROM login_attempts WHERE ok = FALSE "
+                                             "AND ts > NOW() - INTERVAL '15 minutes'")["n"].iloc[0])
+                    if fails >= MAX_FAILS or all_fails >= MAX_FAILS * 6:
+                        st.error("🚫 Too many failed attempts. Please try again in 15 minutes.")
+                    else:
+                        row = query_df("SELECT id, username, password_hash, role, totp_secret, active "
+                                       "FROM users WHERE LOWER(username) = LOWER(%s)", (uname,))
+                        user = None if row.empty else row.iloc[0]
+                        stored = make_password_hash("not-a-real-user") if user is None else user["password_hash"]
+                        ok_pass = verify_hash(password, stored)      # always runs, so timing doesn't reveal valid usernames
+                        ok_user = user is not None and bool(user["active"])
+                        secret = user["totp_secret"] if user is not None else None
+                        ok_2fa = verify_totp(secret, code) if isinstance(secret, str) and secret else True
+                        if ok_user and ok_pass and ok_2fa:
+                            run("DELETE FROM login_attempts WHERE LOWER(COALESCE(username,'')) = LOWER(%s)", (uname,))
+                            st.session_state.authenticated = True
+                            st.session_state.user = {"id": int(user["id"]), "username": str(user["username"]),
+                                                     "role": str(user["role"])}
+                            st.rerun()
+                        else:
+                            run("INSERT INTO login_attempts (ok, username) VALUES (FALSE, %s)", (uname[:60],))
+                            time_mod.sleep(1)
+                            left = MAX_FAILS - fails - 1
+                            st.error(f"❌ Invalid credentials. {max(left, 0)} attempt(s) left before lockout.")
+    st.stop()
+
+if DB_ERROR:
+    st.error(f"⚠️ Database connection failed: {DB_ERROR}")
+    st.stop()
+
+# Re-check the account on every run: a disabled or deleted user is signed out straight away,
+# and a changed role takes effect immediately.
+_me = query_df("SELECT username, role, active FROM users WHERE id = %s", (uid(),))
+if _me.empty or not bool(_me.iloc[0]["active"]):
+    for _k in list(st.session_state.keys()):
+        del st.session_state[_k]
+    st.rerun()
+st.session_state.user["role"] = str(_me.iloc[0]["role"])
+st.session_state.user["username"] = str(_me.iloc[0]["username"])
+
+# ==========================================================
+# SETTINGS
+# ==========================================================
+SETTING_DEFAULTS = {
+    "rate_GOGO": "9.50", "rate_CHINESE": "11.00", "rate_DANIELLE": "14.00",
+    "gogo_rent": "400.00", "gogo_start": "384.75",
+    "auto_rent": "0", "rent_day": "1", "auto_rent_since": "",
+    "goal_weekly": "0", "goal_monthly": "0",
+    "wa_GOGO": "", "wa_CHINESE": "", "wa_DANIELLE": "",
+    # UK tax (editable estimates - check gov.uk for the current tax year)
+    "tax_pa": "12570", "tax_basic_upper": "50270", "tax_add_threshold": "125140",
+    "tax_basic_rate": "20", "tax_higher_rate": "40", "tax_add_rate": "45",
+    "ni_lower": "12570", "ni_upper": "50270", "ni_main": "6", "ni_top": "2",
+    "mile_rate_1": "0.45", "mile_rate_2": "0.25", "mile_threshold": "10000",
+    # trading journal
+    "tj_capital": "10000",
+}
+
+
+def load_settings():
+    try:
+        prefix = f"{uid()}:"
+        rows = query_df("SELECT key, value FROM app_settings WHERE key LIKE %s", (prefix + "%",))
+        stored = {k[len(prefix):]: v for k, v in zip(rows["key"], rows["value"])}
+    except Exception:
+        stored = {}
+    out = {}
+    for k, v in {**SETTING_DEFAULTS, **stored}.items():
+        if k.startswith("wa_"):          # phone numbers stay as text
+            out[k] = str(v or "")
+            continue
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            out[k] = v
+    return out
+
+
+def save_setting(key, value):
+    run("""INSERT INTO app_settings (key, value) VALUES (%s, %s)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""", (f"{uid()}:{key}", str(value)))
+
+
+# ---------- employers (each user has their own list) ----------
+EMP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &.'-]{1,29}$")
+PAY_MODES = {"hourly": "Hourly rate (mileage & tips added separately)",
+             "total_paid": "Total amount paid (mileage worked out automatically)"}
+
+
+def employer_rate(name):
+    df = query_df("SELECT default_rate FROM employers WHERE user_id = %s AND name = %s", (uid(), name))
+    return float(df["default_rate"].iloc[0]) if not df.empty else 0.0
+
+
+def load_employers():
+    q = "SELECT id, name, default_rate, pay_mode, active FROM employers WHERE user_id = %s ORDER BY id"
+    df = query_df(q, (uid(),))
     if df.empty:
-        return df
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    for c in NUM:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(3).astype(int)
-    for c in ["setup", "mood", "tags", "notes"]:
-        df[c] = df[c].fillna("").astype(str)
+        flag = f"{uid()}:employers_seeded"
+        if query_df("SELECT 1 FROM app_settings WHERE key = %s", (flag,)).empty:
+            # Accounts that already have shifts or saved rates keep their original three employers.
+            legacy = (not query_df("SELECT 1 FROM shifts WHERE user_id = %s LIMIT 1", (uid(),)).empty
+                      or not query_df("SELECT 1 FROM app_settings WHERE key LIKE %s LIMIT 1", (f"{uid()}:rate%",)).empty)
+            if legacy:
+                st_ = load_settings()
+                for nm, mode in (("GOGO", "hourly"), ("CHINESE", "total_paid"), ("DANIELLE", "hourly")):
+                    run("INSERT INTO employers (user_id, name, default_rate, pay_mode) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (uid(), nm, float(st_.get(f"rate_{nm}", 0.0)), mode))
+            run("INSERT INTO app_settings (key, value) VALUES (%s, '1') ON CONFLICT (key) DO UPDATE SET value = '1'", (flag,))
+            df = query_df(q, (uid(),))
+    df["default_rate"] = pd.to_numeric(df["default_rate"], errors="coerce").fillna(0.0)
+    df["active"] = df["active"].astype(bool)
     return df
 
 
-def enrich(df):
-    d = df.copy().sort_values(["trade_date", "id"]).reset_index(drop=True)
-    sign = np.where(d["side"] == "Long", 1, -1)
-    d["gross"] = (d["exit_price"] - d["entry_price"]) * sign * d["qty"] * d["multiplier"]
-    d["net"] = d["gross"] - d["fees"]
-    risk = (d["entry_price"] - d["stop_price"]).abs() * d["qty"] * d["multiplier"]
-    d["r"] = np.where((d["stop_price"] > 0) & (risk > 0), d["net"] / risk.where(risk > 0, np.nan), np.nan)
-    d["weekday"] = d["trade_date"].dt.day_name()
-    return d
+def add_employer(name, rate, mode="hourly", wa=""):
+    """Add an employer with a default hourly rate. Returns (ok, message, cleaned_name)."""
+    name = " ".join(str(name).split()).upper()
+    if not EMP_NAME_RE.match(name):
+        return False, "Use 2–30 characters: letters, numbers, spaces, & . ' or -", name
+    if float(rate) < 0:
+        return False, "The rate can't be negative.", name
+    if mode not in PAY_MODES:
+        mode = "hourly"
+    num = ""
+    if str(wa).strip():
+        num = normalize_phone(wa)
+        if not num:
+            return False, "Couldn't read that WhatsApp number (try 07123 456789 or +44 7123 456789).", name
+    if not query_df("SELECT 1 FROM employers WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid(), name)).empty:
+        return False, f"“{name}” already exists (if it's hidden, restore it in Settings → Employers).", name
+    run("INSERT INTO employers (user_id, name, default_rate, pay_mode) VALUES (%s,%s,%s,%s)",
+        (uid(), name, round(float(rate), 2), mode))
+    if num:
+        save_setting(f"wa_{name}", num)
+    return True, f"Employer “{name}” added with a default rate of £{float(rate):.2f}/hr.", name
 
 
-def streaks(net):
-    best_w = best_l = cur_w = cur_l = 0
-    for v in net:
-        cur_w = cur_w + 1 if v > 0 else 0
-        cur_l = cur_l + 1 if v < 0 else 0
-        best_w, best_l = max(best_w, cur_w), max(best_l, cur_l)
-    return best_w, best_l
+def render_add_employer(key):
+    ss_ = st.session_state
+    with st.form(f"add_emp_{key}"):
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Employer name", placeholder="e.g. TESCO")
+        rate = c2.number_input("Default hourly rate (£)", min_value=0.0, value=10.0, step=0.10, format="%.2f")
+        mode = st.radio("How does this employer pay you?", list(PAY_MODES), format_func=PAY_MODES.get)
+        wa = st.text_input("WhatsApp number (optional)", placeholder="07… or +44…")
+        submitted = st.form_submit_button("➕ Add employer", type="primary")
+    if submitted:
+        ok, msg, nm = add_employer(name, rate, mode, wa)
+        if ok:
+            ss_.employer_sel = nm            # pre-select the new employer on the rota form
+            ss_.rate_input = float(rate)
+            ss_.flash = ("success", msg)
+            st.rerun()
+        else:
+            st.error(msg)
 
 
-def metrics(d, capital):
-    wins, losses = d[d["net"] > 0], d[d["net"] < 0]
-    gw, gl = float(wins["net"].sum()), float(-losses["net"].sum())
-    eq = capital + d["net"].cumsum()
-    peak = np.maximum(eq.cummax(), capital)
-    dd = eq - peak
-    wr = len(wins) / len(d)
-    avg_w = float(wins["net"].mean()) if len(wins) else 0.0
-    avg_l = float(losses["net"].mean()) if len(losses) else 0.0
-    bw, bl = streaks(d["net"])
-    return {
-        "net": float(d["net"].sum()), "n": len(d), "win_rate": wr * 100, "avg_w": avg_w, "avg_l": avg_l,
-        "pf": gw / gl if gl else (np.inf if gw else 0.0), "expectancy": wr * avg_w + (1 - wr) * avg_l,
-        "avg_r": d["r"].mean(), "max_dd": float(dd.min()),
-        "max_dd_pct": float((dd / peak.where(peak > 0, np.nan)).min() * 100),
-        "best": float(d["net"].max()), "worst": float(d["net"].min()), "bw": bw, "bl": bl,
-        "eq": eq.reset_index(drop=True), "dd": dd.reset_index(drop=True),
-    }
+def rate_for(name):
+    return float(EMP_RATES.get(name, 0.0))
 
 
-def breakdown(d, col):
-    g = d.groupby(col, dropna=False)
-    out = pd.DataFrame({
-        "Trades": g.size(),
-        "Win rate %": g["net"].apply(lambda s: (s > 0).mean() * 100).round(1),
-        "Net P&L": g["net"].sum().round(2),
-        "Avg P&L": g["net"].mean().round(2),
-        "Avg R": g["r"].mean().round(2),
-    }).reset_index().rename(columns={col: "Group"})
-    return out.sort_values("Net P&L", ascending=False)
+def emp_color(name):
+    return EMP_COLORS[ALL_EMPLOYERS.index(name) % len(EMP_COLORS)] if name in ALL_EMPLOYERS else "#64748b"
 
 
-# ---------- screenshots ----------
-MAX_SHOTS = 8          # per trade
-MAX_UPLOAD_MB = 10     # per image, before compression
-IMG_TYPES = ["png", "jpg", "jpeg", "webp"]
+# ==========================================================
+# DATA LAYER
+# ==========================================================
+SHIFT_NUM_COLS = ["hourly_rate", "hours_worked", "hourly_earning", "mileage_earning", "tips",
+                  "fuel_cost", "expense_cost", "gross_earning", "miles"]
 
 
-def md_safe(s):
-    return str(s or "").replace("$", "\\$")
-
-
-def compress_image(data):
-    """Shrink a screenshot to at most 1800px and store it as JPEG. Returns (bytes, mime) or (None, reason)."""
+def load_shifts():
     try:
-        from PIL import Image
-        im = Image.open(io.BytesIO(data))
-        im.load()
-        im.thumbnail((1800, 1800))
-        if im.mode in ("RGBA", "LA", "P"):
-            im = im.convert("RGBA")
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            bg.paste(im, mask=im.split()[-1])
-            im = bg
-        elif im.mode != "RGB":
-            im = im.convert("RGB")
-        out = io.BytesIO()
-        im.save(out, "JPEG", quality=85, optimize=True)
-        return out.getvalue(), "image/jpeg"
+        df = query_df("SELECT * FROM shifts WHERE user_id = %s", (uid(),)).drop(columns=["user_id"], errors="ignore")
     except Exception as e:
-        return None, str(e)
+        st.error(f"Error loading shifts: {e}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["shift_date"] = pd.to_datetime(df["shift_date"])
+    for col in SHIFT_NUM_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df["paid"] = df["paid"].fillna(True).astype(bool)
+    df["week_start"] = df["shift_date"] - pd.to_timedelta(df["shift_date"].dt.weekday, unit="D")
+    return df.sort_values(["shift_date", "id"], ascending=[False, False]).reset_index(drop=True)
 
 
-def shot_counts(a):
-    df = a.query_df("SELECT trade_id, COUNT(*) AS n FROM trading_journal_shots WHERE user_id = %s GROUP BY trade_id", (a.uid(),))
-    return {int(t): int(n) for t, n in zip(df["trade_id"], df["n"])}
-
-
-def load_shots(a, trade_id):
-    df = a.query_df("SELECT id, filename, data FROM trading_journal_shots WHERE user_id = %s AND trade_id = %s ORDER BY id",
-                    (a.uid(), int(trade_id)))
-    return [{"id": int(r.id), "filename": r.filename or "", "data": bytes(r.data)} for r in df.itertuples()]
-
-
-def save_shots(a, trade_id, files):
-    """Compress and store uploaded images for a trade. Returns (number_saved, list_of_problems)."""
-    import psycopg2
-    have = shot_counts(a).get(int(trade_id), 0)
-    saved, problems = 0, []
-    for f in files or []:
-        if have + saved >= MAX_SHOTS:
-            problems.append(f"Limit of {MAX_SHOTS} screenshots per trade reached.")
-            break
-        raw = f.getvalue()
-        if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
-            problems.append(f"{f.name} is over {MAX_UPLOAD_MB} MB.")
-            continue
-        data, mime = compress_image(raw)
-        if data is None:
-            problems.append(f"{f.name} isn't a readable image.")
-            continue
-        a.run("INSERT INTO trading_journal_shots (user_id, trade_id, filename, mime, data) VALUES (%s,%s,%s,%s,%s)",
-              (a.uid(), int(trade_id), f.name[:120], mime, psycopg2.Binary(data)))
-        saved += 1
-    return saved, problems
-
-
-def _upload_cb(a, trade_id, key):
-    ss = st.session_state
-    saved, problems = save_shots(a, trade_id, ss.get(key))
-    ss.tj_up_ver += 1
-    if problems:
-        ss.flash = ("warning", f"Saved {saved}. " + " ".join(problems))
-    elif saved:
-        ss.flash = ("success", f"Added {saved} screenshot(s).")
-    else:
-        ss.flash = ("info", "Choose at least one image first.")
-
-
-def _delete_shot_cb(a, shot_id):
-    a.run("DELETE FROM trading_journal_shots WHERE id = %s AND user_id = %s", (int(shot_id), a.uid()))
-    st.session_state.flash = ("success", "Screenshot removed.")
-
-
-def show_img(data, caption=None):
+def load_trans():
     try:
-        st.image(data, caption=caption, width="stretch")
-    except Exception:                      # older Streamlit versions
-        st.image(data, caption=caption, use_container_width=True)
+        df = query_df("SELECT * FROM gogo_transactions WHERE user_id = %s", (uid(),)).drop(columns=["user_id"], errors="ignore")
+    except Exception as e:
+        st.error(f"Error loading transactions: {e}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["trans_date"] = pd.to_datetime(df["trans_date"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    return df.sort_values(["trans_date", "id"]).reset_index(drop=True)
 
 
-def render_trade(a, r, prefix):
-    """One trade as a card: result, details, notes, screenshots, and a box to add more screenshots."""
-    ss = st.session_state
-    tid = int(r["id"])
-    pnl = float(r["net"])
-    tone = "green" if pnl >= 0 else "red"
-    r_txt = f" · {r['r']:.2f}R" if pd.notna(r["r"]) else ""
-    with st.container(border=True):
-        h1, h2 = st.columns([3, 1])
-        h1.markdown(f"**{r['trade_date']:%a %d %b %Y} · {md_safe(r['symbol'])}** · {r['side']}")
-        h2.markdown(f":{tone}[**{a.gbp(pnl)}**]{r_txt}")
-        stop_txt = f" · stop {r['stop_price']:g}" if r["stop_price"] > 0 else ""
-        st.caption(f"Entry {r['entry_price']:g} → exit {r['exit_price']:g} · qty {r['qty']:g}{stop_txt} · fees {a.gbp(r['fees'])}")
-        meta = [str(x) for x in (r["setup"], r["mood"], f"execution {int(r['rating'])}/5", r["tags"]) if x]
-        st.caption(md_safe(" · ".join(meta)))
-        if r["notes"]:
-            st.markdown(md_safe(r["notes"]))
-        shots = load_shots(a, tid)
-        if shots:
-            cols = st.columns(min(3, len(shots)))
-            for i, s in enumerate(shots):
-                with cols[i % 3]:
-                    show_img(s["data"], s["filename"])
-                    st.button("🗑️ Remove", key=f"{prefix}_rm_{s['id']}", on_click=_delete_shot_cb, args=(a, s["id"]))
-        if len(shots) < MAX_SHOTS:
-            with st.expander("➕ Add screenshots"):
-                key = f"{prefix}_up_{tid}_{ss.tj_up_ver}"
-                st.file_uploader("Images", type=IMG_TYPES, accept_multiple_files=True, key=key, label_visibility="collapsed")
-                st.button("Upload", key=f"{prefix}_ub_{tid}", on_click=_upload_cb, args=(a, tid, key))
+def load_templates():
+    return query_df("SELECT * FROM shift_templates WHERE user_id = %s ORDER BY name", (uid(),)).drop(columns=["user_id"], errors="ignore")
 
 
-def render_calendar(a, df, counts):
-    """Month calendar: each day shows its trades, the day's P&L and how many screenshots it has."""
+def calculate_hours(start_t, end_t):
+    s = datetime.combine(date.today(), start_t)
+    e = datetime.combine(date.today(), end_t)
+    if e < s:
+        e += timedelta(days=1)
+    return max(0.0, (e - s).total_seconds() / 3600)
+
+
+def compute_shift(employer, hours, rate, paid_chinese, mileage, tips):
+    hourly = hours * rate
+    warning = None
+    if employer in TOTAL_PAID:
+        mileage = paid_chinese - hourly
+        if mileage < 0:
+            warning = "Total paid is less than the hourly earnings, so mileage was set to £0."
+            mileage = 0.0
+        gross = paid_chinese + tips
+    else:
+        gross = hourly + mileage + tips
+    return hourly, mileage, gross, warning
+
+
+def insert_shift(d, employer, start_s, end_s, rate, hours, hourly, mileage, tips, fuel, exp, gross, miles, paid):
+    run("""INSERT INTO shifts (user_id, shift_date, employer, start_time, end_time, hourly_rate, hours_worked,
+                hourly_earning, mileage_earning, tips, fuel_cost, expense_cost, gross_earning, miles, paid)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (uid(), d, employer, start_s, end_s, rate, round(hours, 2), round(hourly, 2), round(mileage, 2),
+         round(tips, 2), round(fuel, 2), round(exp, 2), round(gross, 2), round(miles, 1), bool(paid)))
+
+
+def build_ledger(start_bal):
+    rows = []
+    shifts = load_shifts()
+    if not shifts.empty:
+        for r in shifts[shifts["employer"] == "GOGO"].itertuples():
+            rows.append((r.shift_date, f"Shift ({r.start_time} – {r.end_time}, {r.hours_worked:.2f} hrs)",
+                         "Wages", float(r.hourly_earning), 0, None))
+    trans = load_trans()
+    if not trans.empty:
+        for r in trans.itertuples():
+            is_rent = r.trans_type == "RENT"
+            desc = "Rent deducted" if is_rent else "Payment received"
+            if isinstance(r.notes, str) and r.notes.strip():
+                desc += f" ({r.notes.strip()})"
+            rows.append((r.trans_date, desc, "Rent" if is_rent else "Payment",
+                         -float(r.amount), 1 if is_rent else 2, int(r.id)))
+    led = pd.DataFrame(rows, columns=["Date", "Details", "Category", "Amount", "Order", "ID"])
+    if led.empty:
+        led["Balance"] = []
+        return led
+    led["Date"] = pd.to_datetime(led["Date"])
+    led = led.sort_values(["Date", "Order"], kind="mergesort").reset_index(drop=True)
+    led["Balance"] = start_bal + led["Amount"].cumsum()
+    led["Month"] = led["Date"].dt.to_period("M")
+    return led
+
+
+def apply_auto_rent(s):
+    """Streamlit has no background scheduler, so due rent is added (once) when the app is opened."""
+    if not s.get("auto_rent") or not s.get("gogo_rent"):
+        return
+    try:
+        since = datetime.strptime(str(s.get("auto_rent_since")), "%Y-%m-%d").date().replace(day=1)
+    except Exception:
+        return
+    day = int(min(max(s.get("rent_day", 1), 1), 28))
+    done = set(query_df("SELECT notes FROM gogo_transactions WHERE user_id = %s AND notes LIKE %s",
+                        (uid(), "auto-rent %"))["notes"].tolist())
+    y, m = since.year, since.month
+    while (y, m) <= (TODAY.year, TODAY.month):
+        due, tag = date(y, m, day), f"auto-rent {y}-{m:02d}"
+        if due <= TODAY and tag not in done:
+            run("INSERT INTO gogo_transactions (user_id, trans_date, trans_type, amount, notes) VALUES (%s,%s,'RENT',%s,%s)",
+                (uid(), due, float(s["gogo_rent"]), tag))
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+
+
+def make_statement_pdf(period, opening, closing, wages, rent, paid, s_d, e_d):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    els = [Paragraph("GOGO Account Statement", styles["Title"]),
+           Paragraph(f"Period: {s_d:%d %b %Y} to {e_d:%d %b %Y} &nbsp;|&nbsp; Generated {TODAY:%d %b %Y}",
+                     styles["Normal"]), Spacer(1, 14)]
+    summary = Table([["Opening balance", gbp(opening)], ["Wages earned", gbp(wages)],
+                     ["Rent deducted", gbp(rent)], ["Payments received", gbp(paid)],
+                     ["Closing balance", gbp(closing)]], colWidths=[200, 120])
+    summary.setStyle(TableStyle([("FONTNAME", (0, 4), (-1, 4), "Helvetica-Bold"),
+                                 ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                                 ("LINEABOVE", (0, 4), (-1, 4), 1, colors.black),
+                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    els += [summary, Spacer(1, 18)]
+    rows = [["Date", "Details", "Category", "Amount (£)", "Balance (£)"]]
+    for r in period.itertuples():
+        rows.append([f"{r.Date:%d %b %Y}", str(r.Details)[:46], r.Category, f"{r.Amount:.2f}", f"{r.Balance:.2f}"])
+    tbl = Table(rows, repeatRows=1, colWidths=[70, 220, 60, 75, 80])
+    tbl.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")),
+                             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                             ("FONTSIZE", (0, 0), (-1, -1), 8),
+                             ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+                             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
+                             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1"))]))
+    els.append(tbl)
+    doc.build(els)
+    return buf.getvalue()
+
+
+def make_employer_pdf(emp, sel, s_d, e_d, flt):
+    """Per-employer statement: every shift with PAID / UNPAID status (hourly pay only)."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    paid_amt = float(sel.loc[sel["paid"], "hourly_earning"].sum())
+    unpaid_amt = float(sel.loc[~sel["paid"], "hourly_earning"].sum())
+    total_amt = paid_amt + unpaid_amt
+    hours = float(sel["hours_worked"].sum())
+    red = colors.HexColor("#b91c1c")
+
+    els = [Paragraph(f"{html.escape(emp)} - Shift Statement", styles["Title"]),
+           Paragraph(f"Period: {s_d:%d %b %Y} to {e_d:%d %b %Y} &nbsp;|&nbsp; Showing: {html.escape(flt)} "
+                     f"&nbsp;|&nbsp; Generated {TODAY:%d %b %Y}", styles["Normal"]),
+           Spacer(1, 6),
+           Paragraph("Amounts are hourly pay only (mileage and tips are paid on the day).", styles["Italic"]),
+           Spacer(1, 12)]
+    summary = Table([["Shifts", str(len(sel))], ["Total hours", f"{hours:.2f}"],
+                     ["Total hourly pay", gbp(total_amt)], ["Paid", gbp(paid_amt)],
+                     ["UNPAID (amount owed)", gbp(unpaid_amt)]], colWidths=[200, 120])
+    summary.setStyle(TableStyle([("FONTNAME", (0, 4), (-1, 4), "Helvetica-Bold"),
+                                 ("TEXTCOLOR", (0, 4), (-1, 4), red),
+                                 ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                                 ("LINEABOVE", (0, 4), (-1, 4), 1, colors.black),
+                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    els += [summary, Spacer(1, 18)]
+
+    rows = [["Date", "Time", "Hours", "Rate (£)", "Hourly pay (£)", "Status"]]
+    style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")),
+             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+             ("FONTSIZE", (0, 0), (-1, -1), 9),
+             ("ALIGN", (2, 0), (4, -1), "RIGHT"),
+             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1"))]
+    for i, r in enumerate(sel.itertuples(), start=1):
+        rows.append([f"{r.shift_date:%a %d %b %Y}", f"{r.start_time}-{r.end_time}", f"{r.hours_worked:.2f}",
+                     f"{r.hourly_rate:.2f}", f"{r.hourly_earning:.2f}", "PAID" if r.paid else "UNPAID"])
+        if not r.paid:
+            style += [("BACKGROUND", (0, i), (-1, i), colors.HexColor("#fee2e2")),
+                      ("TEXTCOLOR", (5, i), (5, i), red), ("FONTNAME", (5, i), (5, i), "Helvetica-Bold")]
+    n = len(rows)
+    rows.append(["TOTAL", "", f"{hours:.2f}", "", f"{total_amt:.2f}", ""])
+    style += [("FONTNAME", (0, n), (-1, n), "Helvetica-Bold"), ("LINEABOVE", (0, n), (-1, n), 1, colors.black)]
+    tbl = Table(rows, repeatRows=1, colWidths=[95, 90, 50, 60, 85, 60])
+    tbl.setStyle(TableStyle(style))
+    els.append(tbl)
+    doc.build(els)
+    return buf.getvalue()
+
+
+# ---------- WhatsApp helpers ----------
+def normalize_phone(raw, default_cc="44"):
+    """'07123 456789' / '+44 (0)7123 456789' / '0044…' -> digits-only international number, or '' if invalid."""
+    s = str(raw or "").strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return ""
+    if s.startswith("+"):
+        pass
+    elif digits.startswith("00"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = default_cc + digits[1:]
+    if digits.startswith(default_cc + "0"):      # +44 (0)7… written with the optional trunk 0
+        digits = default_cc + digits[len(default_cc) + 1:]
+    return digits if 8 <= len(digits) <= 15 else ""
+
+
+def build_wa_message(emp, sel, s_d, e_d, limit=20):
+    un = sel[~sel["paid"]].sort_values("shift_date")
+    total = float(un["hourly_earning"].sum())
+    lines = ["Hi,", "", f"Here is my payment summary for {emp} shifts ({s_d:%d %b %Y} - {e_d:%d %b %Y}).", ""]
+    if un.empty:
+        lines.append("There are no unpaid shifts for this period. Thank you!")
+    else:
+        lines.append("Unpaid shifts (hourly pay):")
+        for r in un.head(limit).itertuples():
+            lines.append(f"• {r.shift_date:%a %d %b} {r.start_time}-{r.end_time} ({r.hours_worked:.2f} hrs) - {gbp(r.hourly_earning)}")
+        if len(un) > limit:
+            lines.append(f"…and {len(un) - limit} more shift(s)")
+        lines += ["", f"*Total unpaid: {gbp(total)}* ({len(un)} shift(s))", "",
+                  "The PDF statement with full details is attached.",
+                  "Could you please let me know when this will be paid? Thank you!"]
+    return "\n".join(lines)
+
+
+def wa_share_html(pdf_bytes, text, filename):
+    """A button that opens the phone's share sheet with the PDF + message (works only where the browser allows file sharing)."""
+    b64 = base64.b64encode(pdf_bytes).decode()
+    js_text = json.dumps(text).replace("</", "<\\/")
+    js_name = json.dumps(filename)
+    return f"""
+<div style="font-family:Inter,-apple-system,sans-serif">
+  <button id="sb" style="padding:.55rem 1.2rem;border:none;border-radius:12px;font-weight:600;font-size:14px;color:#fff;
+     cursor:pointer;background:linear-gradient(120deg,#4f46e5,#7c3aed);box-shadow:0 6px 18px rgba(79,70,229,.35)">📤 Share PDF + message</button>
+  <div id="sm" style="font-size:12px;margin-top:8px;color:#888"></div>
+</div>
+<script>
+const b64 = "{b64}", text = {js_text}, name = {js_name};
+document.getElementById("sb").onclick = async () => {{
+  const m = document.getElementById("sm");
+  try {{
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const file = new File([bytes], name, {{type: "application/pdf"}});
+    if (navigator.canShare && navigator.canShare({{files: [file]}})) {{
+      await navigator.share({{files: [file], text: text}});
+    }} else {{
+      m.textContent = "This browser can't share files from here. Use Download PDF + the WhatsApp button instead.";
+    }}
+  }} catch (e) {{
+    if (e.name !== "AbortError") m.textContent = "Sharing isn't available here (" + e.name + "). Use Download PDF + the WhatsApp button instead.";
+  }}
+}};
+</script>"""
+
+
+# ---------- personal finance helpers ----------
+EXPENSE_CATS = ["Food", "Grocery", "Train to Uni", "Car", "Car Insurance", "Send Home", "Mobile Bill"]
+CAT_ICONS = {"Food": "🍔", "Grocery": "🛒", "Train to Uni": "🚆", "Car": "🚗",
+             "Car Insurance": "🛡️", "Send Home": "🏠", "Mobile Bill": "📱"}
+
+
+def add_months(d, n):
+    y = d.year + (d.month - 1 + n) // 12
+    m = (d.month - 1 + n) % 12 + 1
+    return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+
+def month_bounds(y, m):
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
+def load_expenses():
+    cols = ["id", "expense_date", "category", "amount", "notes"]
+    try:
+        df = query_df("SELECT * FROM personal_expenses WHERE user_id = %s", (uid(),)).drop(columns=["user_id"], errors="ignore")
+    except Exception as e:
+        st.error(f"Error loading expenses: {e}")
+        return pd.DataFrame(columns=cols)
+    if df.empty:
+        return df
+    df["expense_date"] = pd.to_datetime(df["expense_date"])
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    return df.sort_values(["expense_date", "id"], ascending=[False, False]).reset_index(drop=True)
+
+
+def earnings_in(shifts, s_d, e_d, use_net, only_paid):
+    """Total earnings from the shifts table between two dates -> (amount, number_of_shifts)."""
+    if shifts.empty:
+        return 0.0, 0
+    d = shifts["shift_date"].dt.date
+    sub = shifts[(d >= s_d) & (d <= e_d)]
+    if only_paid:
+        sub = sub[sub["paid"]]
+    if sub.empty:
+        return 0.0, 0
+    val = sub["gross_earning"] - ((sub["fuel_cost"] + sub["expense_cost"]) if use_net else 0.0)
+    return float(val.sum()), len(sub)
+
+
+def monthly_earnings(shifts, use_net, only_paid):
+    if shifts.empty:
+        return pd.Series(dtype=float)
+    sub = shifts[shifts["paid"]] if only_paid else shifts
+    if sub.empty:
+        return pd.Series(dtype=float)
+    val = sub["gross_earning"] - ((sub["fuel_cost"] + sub["expense_cost"]) if use_net else 0.0)
+    return val.groupby(sub["shift_date"].dt.to_period("M")).sum()
+
+
+# ---------- tax maths ----------
+def uk_tax_year(d):
+    return d.year if (d.month, d.day) >= (4, 6) else d.year - 1
+
+
+def est_income_tax(profit, s):
+    pa, bu, at = s["tax_pa"], s["tax_basic_upper"], s["tax_add_threshold"]
+    return (max(0, min(profit, bu) - pa) * s["tax_basic_rate"] / 100
+            + max(0, min(profit, at) - bu) * s["tax_higher_rate"] / 100
+            + max(0, profit - at) * s["tax_add_rate"] / 100)
+
+
+def est_class4_ni(profit, s):
+    return (max(0, min(profit, s["ni_upper"]) - s["ni_lower"]) * s["ni_main"] / 100
+            + max(0, profit - s["ni_upper"]) * s["ni_top"] / 100)
+
+
+# ==========================================================
+# SIDEBAR / NAV
+# ==========================================================
+PAGES = ["➕ Enter Rota", "📊 History & Earnings", "🏠 GOGO Ledger", "💼 Unpaid & Owed",
+         "🎯 Goals & Insights", "📅 Calendar", "🧾 Tax & Mileage", "💰 Personal Finance & Expenses",
+         "📈 Trading Journal", "🛠️ Settings & Backup"]
+
+bar_l, bar_r = st.columns([5, 1])
+with bar_l:
+    st.markdown(f'<div class="brand">💷 Rota Tracker <span style="font-size:.8rem;opacity:.6;font-weight:600">'
+                f'· {html.escape(st.session_state.user["username"])}</span></div>', unsafe_allow_html=True)
+with bar_r:
+    if st.button("🚪 Logout"):
+        for _k in list(st.session_state.keys()):   # wipe everything so nothing leaks to the next login
+            del st.session_state[_k]
+        st.rerun()
+
+try:
+    nav_box = st.container(key="nav")
+except TypeError:  # very old Streamlit without container keys
+    nav_box = st.container()
+with nav_box:
+    page = st.radio("Navigation", PAGES, horizontal=True, label_visibility="collapsed", key="nav_page")
+
+settings = load_settings()
+_emp_df = load_employers()
+ALL_EMPLOYERS = _emp_df["name"].tolist()
+EMPLOYERS = _emp_df.loc[_emp_df["active"], "name"].tolist()
+EMP_RATES = dict(zip(_emp_df["name"], _emp_df["default_rate"].astype(float)))
+TOTAL_PAID = set(_emp_df.loc[_emp_df["pay_mode"] == "total_paid", "name"])
+try:
+    apply_auto_rent(settings)
+except Exception as e:
+    st.warning(f"Auto-rent skipped: {e}")
+
+ss = st.session_state
+
+# ==========================================================
+# PAGE: ENTER ROTA
+# ==========================================================
+if page == PAGES[0]:
+    hero("➕ Log a Shift", "Record your hours, tips and expenses in seconds.")
+    show_flash()
+
+    if not EMPLOYERS:
+        st.info("👋 Add your first employer to start logging shifts.")
+        render_add_employer("first")
+        st.stop()
+    if ss.get("employer_sel") not in EMPLOYERS:   # first visit, or the employer was archived
+        ss.employer_sel = EMPLOYERS[0]
+        ss.rate_input = rate_for(EMPLOYERS[0])
+    ss.setdefault("rate_input", rate_for(EMPLOYERS[0]))
+    ss.setdefault("start_time_in", time(9, 0))
+    ss.setdefault("end_time_in", time(17, 0))
+
+    def on_employer_change():
+        ss.rate_input = employer_rate(ss.employer_sel)
+
+    def apply_template():
+        row = query_df("SELECT * FROM shift_templates WHERE id = %s AND user_id = %s", (int(ss.tpl_sel), uid()))
+        if row.empty:
+            return
+        r = row.iloc[0]
+        ss.employer_sel = r["employer"]
+        ss.rate_input = float(r["hourly_rate"])
+        ss.start_time_in = parse_hhmm(r["start_time"])
+        ss.end_time_in = parse_hhmm(r["end_time"])
+        ss.flash = ("success", f"Template “{r['name']}” applied.")
+
+    def save_template():
+        name = (ss.get("tpl_name") or "").strip()
+        if not name:
+            ss.flash = ("error", "Give the template a name first.")
+            return
+        run("INSERT INTO shift_templates (user_id, name, employer, start_time, end_time, hourly_rate) VALUES (%s,%s,%s,%s,%s,%s)",
+            (uid(), name, ss.employer_sel, ss.start_time_in.strftime("%H:%M"), ss.end_time_in.strftime("%H:%M"),
+             float(ss.rate_input)))
+        ss.tpl_name = ""
+        ss.flash = ("success", f"Template “{name}” saved.")
+
+    with st.expander("⚙️ Employers & default rates"):
+        st.markdown("**Default hourly rates**")
+        with st.form("rates_form"):
+            rc = st.columns(3)
+            new_rates = {emp: rc[i % 3].number_input(f"{emp} (£)", min_value=0.0, value=rate_for(emp), step=0.10,
+                                                     format="%.2f", key=f"dr_{emp}_{rate_for(emp)}")
+                         for i, emp in enumerate(EMPLOYERS)}
+            if st.form_submit_button("Save default rates", type="primary"):
+                for emp, val in new_rates.items():
+                    run("UPDATE employers SET default_rate = %s WHERE user_id = %s AND name = %s", (round(val, 2), uid(), emp))
+                ss.rate_input = new_rates.get(ss.get("employer_sel"), ss.rate_input)
+                ss.flash = ("success", "Default rates saved.")
+                st.rerun()
+        st.markdown("**Add a new employer**")
+        render_add_employer("rota")
+        st.caption("To archive or delete an employer, open Settings → 🏢 Employers.")
+
+    templates = load_templates()
+    with st.expander("⚡ Templates & copy last week"):
+        t1, t2 = st.columns(2, gap="large")
+        with t1:
+            st.markdown("**Shift templates**")
+            if templates.empty:
+                st.caption("No templates yet. Fill the form below, name it here and save.")
+            else:
+                tmap = {int(r.id): f"{r.name} — {r.employer} {r.start_time}-{r.end_time} @ £{r.hourly_rate:.2f}"
+                        for r in templates.itertuples()}
+                st.selectbox("Template", list(tmap), format_func=tmap.get, key="tpl_sel")
+                b1, b2 = st.columns(2)
+                b1.button("Apply", on_click=apply_template)
+                if b2.button("Delete"):
+                    run("DELETE FROM shift_templates WHERE id = %s AND user_id = %s", (int(ss.tpl_sel), uid()))
+                    st.rerun()
+            st.text_input("Save current form as template", placeholder="e.g. GOGO 9–5", key="tpl_name")
+            st.button("Save template", on_click=save_template)
+        with t2:
+            st.markdown("**Copy a week**")
+            mon = TODAY - timedelta(days=TODAY.weekday())
+            src = st.date_input("Copy shifts from the week containing", value=mon - timedelta(days=7), key="copy_src")
+            dst = st.date_input("…into the week containing", value=mon, key="copy_dst")
+            st.caption("Copies hours and hourly pay only. Edit afterwards to add tips, mileage and costs.")
+            if st.button("Copy week"):
+                src_mon = src - timedelta(days=src.weekday())
+                offset = (dst - timedelta(days=dst.weekday())) - src_mon
+                allsh = load_shifts()
+                if allsh.empty:
+                    st.warning("No shifts to copy.")
+                else:
+                    existing = {(r.shift_date.date(), r.employer, r.start_time, r.end_time) for r in allsh.itertuples()}
+                    block = allsh[(allsh["shift_date"].dt.date >= src_mon) &
+                                  (allsh["shift_date"].dt.date <= src_mon + timedelta(days=6))]
+                    n = 0
+                    for r in block.itertuples():
+                        nd = r.shift_date.date() + offset
+                        if (nd, r.employer, r.start_time, r.end_time) in existing:
+                            continue
+                        insert_shift(nd, r.employer, r.start_time, r.end_time, r.hourly_rate, r.hours_worked,
+                                     r.hourly_earning, 0, 0, 0, 0, r.hourly_earning, 0, False)
+                        n += 1
+                    ss.flash = ("success" if n else "info", f"Copied {n} shift(s)." if n else "Nothing new to copy.")
+                    st.rerun()
+
+    st.markdown("---")
+    col1, col2 = st.columns(2, gap="large")
+    with col1:
+        st.subheader("🗓️ When & where")
+        employer = st.selectbox("Employer / Location", EMPLOYERS, key="employer_sel", on_change=on_employer_change)
+        shift_date = st.date_input("Shift Date", value=TODAY)
+        t1, t2 = st.columns(2)
+        start_time = t1.time_input("Start Time", key="start_time_in")
+        end_time = t2.time_input("End Time", key="end_time_in")
+    with col2:
+        st.subheader("💷 Pay details")
+        hourly_rate = st.number_input("Hourly Rate (£)", min_value=0.0, step=0.10, format="%.2f", key="rate_input")
+        paid_chinese, mileage_in = 0.0, 0.0
+        if employer in TOTAL_PAID:
+            st.info("💡 **Total-paid mode:** enter the total amount paid. Mileage is calculated automatically.")
+            paid_chinese = st.number_input("Total Amount Paid by Employer (£)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            tips = st.number_input("Tips Earned (£)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+        else:
+            a1, a2 = st.columns(2)
+            mileage_in = a1.number_input("Mileage Earned (£)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            tips = a2.number_input("Tips Earned (£)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+        d1, d2, d3 = st.columns(3)
+        fuel_cost = d1.number_input("Fuel Cost (£) −", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+        expense_cost = d2.number_input("Other Expenses (£) −", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+        miles = d3.number_input("Miles driven", min_value=0.0, value=0.0, step=1.0, format="%.1f")
+        is_paid = st.checkbox("✅ Shift already paid", value=False, key="paid_in",
+                              help="Leave unticked if you are still waiting to be paid for this shift.")
+
+    hours = calculate_hours(start_time, end_time)
+    hourly_e, mileage_e, gross_e, warn = compute_shift(employer, hours, hourly_rate, paid_chinese, mileage_in, tips)
+    net_e = gross_e - fuel_cost - expense_cost
+
+    st.markdown("---")
+    st.subheader("🔎 Live preview")
+    p = st.columns(4)
+    with p[0]: card("Hours", f"{hours:.2f}", "this shift", "indigo")
+    with p[1]: card("Hourly pay", gbp(hourly_e), f"@ £{hourly_rate:.2f}/hr", "teal")
+    with p[2]: card("Gross", gbp(gross_e), f"mileage {gbp(mileage_e)} · tips {gbp(tips)}", "green")
+    with p[3]: card("Net (after costs)", gbp(net_e), f"costs {gbp(fuel_cost + expense_cost)}", "amber")
+    if warn:
+        st.warning(f"⚠️ {warn}")
+
+    if st.button("💾 Save Shift", type="primary"):
+        if hours <= 0:
+            st.error("Start and end time are the same – the shift has 0 hours.")
+        else:
+            insert_shift(shift_date, employer, start_time.strftime("%H:%M"), end_time.strftime("%H:%M"),
+                         hourly_rate, hours, hourly_e, mileage_e, tips, fuel_cost, expense_cost, gross_e, miles, is_paid)
+            st.success(f"Shift saved! **{hours:.2f} hours**, **{gbp(gross_e)}** gross.")
+            st.balloons()
+
+    recent = load_shifts()
+    if not recent.empty:
+        st.markdown("---")
+        st.subheader("🕒 Recent shifts")
+        show_table(recent.head(5)[["shift_date", "employer", "start_time", "end_time", "hours_worked", "gross_earning", "paid"]], {
+            "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"), "employer": "Location",
+            "start_time": "Start", "end_time": "End",
+            "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
+            "gross_earning": st.column_config.NumberColumn("Gross (£)", format="%.2f"),
+            "paid": st.column_config.CheckboxColumn("Paid")})
+
+# ==========================================================
+# PAGE: HISTORY
+# ==========================================================
+elif page == PAGES[1]:
+    hero("📊 Earnings History", "Filter, analyse, edit and export everything you've worked.")
+    show_flash()
+    df = load_shifts()
+
+    if df.empty:
+        st.info("No shifts recorded yet. Head to **Enter Rota** to add your first one.")
+        st.stop()
+
+    show_net = st.toggle("📉 Show net earnings (subtract fuel & expenses)", value=False)
+    f1, f2 = st.columns(2)
+    with f1:
+        sel_emp = st.selectbox("Filter by Employer", ["All Employers"] + sorted(df["employer"].dropna().unique().tolist()))
+    with f2:
+        min_d, max_d = df["shift_date"].min().date(), df["shift_date"].max().date()
+        date_range = st.date_input("Date Range", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+
+    fdf = df.copy()
+    if sel_emp != "All Employers":
+        fdf = fdf[fdf["employer"] == sel_emp]
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        fdf = fdf[(fdf["shift_date"].dt.date >= date_range[0]) & (fdf["shift_date"].dt.date <= date_range[1])]
+    else:
+        st.info("Pick an end date to apply the date filter.")
+    if fdf.empty:
+        st.warning("No shifts match these filters.")
+        st.stop()
+
+    fdf = fdf.copy()
+    fdf["deductions"] = fdf["fuel_cost"] + fdf["expense_cost"]
+    fdf["final"] = fdf["gross_earning"] - fdf["deductions"] if show_net else fdf["gross_earning"]
+    hours_total, gross_total, deduct_total = fdf["hours_worked"].sum(), fdf["gross_earning"].sum(), fdf["deductions"].sum()
+    headline = gross_total - deduct_total if show_net else gross_total
+
+    st.markdown("---")
+    st.subheader("Summary")
+    k = st.columns(4)
+    with k[0]: card("Shifts", f"{len(fdf)}", "in selection", "slate")
+    with k[1]: card("Hours", f"{hours_total:.2f}", "total worked", "indigo")
+    with k[2]: card("Hourly pay", gbp(fdf["hourly_earning"].sum()), "base wages", "teal")
+    with k[3]: card("Avg £/hour", gbp(headline / hours_total if hours_total else 0), "net" if show_net else "gross", "amber")
+    k = st.columns(4)
+    with k[0]: card("Mileage", gbp(fdf["mileage_earning"].sum()), "", "teal")
+    with k[1]: card("Tips", gbp(fdf["tips"].sum()), "", "green")
+    with k[2]: card("Fuel & expenses", gbp(-deduct_total), "", "red")
+    with k[3]: card("NET EARNINGS" if show_net else "TOTAL EARNINGS", gbp(headline),
+                    f"gross {gbp(gross_total)}" if show_net else "before costs", "green" if headline >= 0 else "red")
+
+    unp = fdf[~fdf["paid"]]
+    k = st.columns(3)
+    with k[0]: card("Unpaid (hourly pay)", gbp(unp["hourly_earning"].sum()), "mileage & tips are paid on the day",
+                    "amber" if len(unp) else "green")
+    with k[1]: card("Unpaid shifts", f"{len(unp)}", f"{unp['hours_worked'].sum():.2f} hrs outstanding",
+                    "red" if len(unp) else "slate")
+    with k[2]: card("Paid (hourly pay)", gbp(fdf.loc[fdf["paid"], "hourly_earning"].sum()), "already received", "green")
+
+    st.markdown("---")
+    tab_log, tab_week, tab_emp = st.tabs(["📋 Shift log", "📈 Weekly trend", "🏢 By employer"])
+    with tab_log:
+        ss.setdefault("log_ver", 0)
+        sel_all = st.checkbox("Select all shifts shown", key="log_sel_all")
+        log = fdf[["id", "shift_date", "employer", "start_time", "end_time", "hours_worked", "hourly_earning",
+                   "mileage_earning", "tips", "fuel_cost", "expense_cost", "miles", "paid", "final"]].copy()
+        log["status"] = log["paid"].map({True: "✅ Paid", False: "⏳ Unpaid"})
+        log = log.drop(columns=["paid"])
+        log.insert(0, "Select", bool(sel_all))
+        mny = lambda t: st.column_config.NumberColumn(t, format="%.2f")
+        edited = st.data_editor(
+            log, hide_index=True, key=f"log_editor_{ss.log_ver}_{int(sel_all)}",
+            disabled=[c for c in log.columns if c != "Select"],
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select"), "id": None,
+                "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"), "employer": "Location",
+                "start_time": "Start", "end_time": "End",
+                "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
+                "hourly_earning": mny("Hourly (£)"), "mileage_earning": mny("Mileage (£)"), "tips": mny("Tips (£)"),
+                "fuel_cost": mny("Fuel (−£)"), "expense_cost": mny("Expense (−£)"),
+                "miles": st.column_config.NumberColumn("Miles", format="%.1f"),
+                "status": "Status", "final": mny("Net (£)" if show_net else "Gross (£)")})
+        picked = edited.loc[edited["Select"], "id"].astype(int).tolist()
+        st.caption(f"{len(picked)} shift(s) selected — tick the **Select** boxes, then choose an action:")
+        b1, b2, _sp = st.columns([1, 1, 2])
+        if b1.button("✅ Mark selected as paid", type="primary"):
+            if picked:
+                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s) AND user_id = %s", (picked, uid()))
+                ss.log_ver += 1
+                ss.flash = ("success", f"Marked {len(picked)} shift(s) as paid.")
+                st.rerun()
+            else:
+                st.warning("Tick at least one shift first.")
+        if b2.button("⏳ Mark selected as unpaid"):
+            if picked:
+                run("UPDATE shifts SET paid = FALSE WHERE id = ANY(%s) AND user_id = %s", (picked, uid()))
+                ss.log_ver += 1
+                ss.flash = ("success", f"Marked {len(picked)} shift(s) as unpaid.")
+                st.rerun()
+            else:
+                st.warning("Tick at least one shift first.")
+    with tab_week:
+        st.caption("Earnings per week (weeks start on Monday)")
+        st.bar_chart(fdf.groupby("week_start")["final"].sum().sort_index(), color="#6366f1")
+    with tab_emp:
+        st.caption("Earnings per employer")
+        st.bar_chart(fdf.groupby("employer")["final"].sum().sort_values(ascending=False), color="#14b8a6")
+
+    labels = {int(r.id): f"{r.shift_date:%d %b %Y} · {r.employer} · {r.start_time}–{r.end_time} · {gbp(r.gross_earning)}"
+              for r in fdf.itertuples()}
+
+    with st.expander("✏️ Edit a shift"):
+        esel = st.selectbox("Select shift to edit", list(labels), format_func=labels.get, key="edit_sel")
+        r = fdf[fdf["id"] == esel].iloc[0]
+        kk = f"e{esel}_{int(bool(r['paid']))}_"
+        with st.form("edit_shift_form"):
+            c1, c2 = st.columns(2)
+            e_emp = c1.selectbox("Employer", ALL_EMPLOYERS, index=ALL_EMPLOYERS.index(r["employer"]) if r["employer"] in ALL_EMPLOYERS else 0, key=kk + "emp")
+            e_date = c2.date_input("Date", value=r["shift_date"].date(), key=kk + "date")
+            e_st = c1.time_input("Start", value=parse_hhmm(r["start_time"]), key=kk + "st")
+            e_en = c2.time_input("End", value=parse_hhmm(r["end_time"]), key=kk + "en")
+            e_rate = c1.number_input("Hourly rate (£)", min_value=0.0, value=float(r["hourly_rate"]), step=0.10, format="%.2f", key=kk + "rate")
+            e_mil_e = c2.number_input("Mileage earned (£) — ignored for total-paid employers", min_value=0.0, value=float(r["mileage_earning"]), step=1.0, format="%.2f", key=kk + "me")
+            e_total = c1.number_input("Total paid (£) — total-paid employers only", min_value=0.0, value=float(r["hourly_earning"] + r["mileage_earning"]), step=1.0, format="%.2f", key=kk + "tp")
+            e_tips = c2.number_input("Tips (£)", min_value=0.0, value=float(r["tips"]), step=1.0, format="%.2f", key=kk + "tips")
+            e_fuel = c1.number_input("Fuel (£)", min_value=0.0, value=float(r["fuel_cost"]), step=1.0, format="%.2f", key=kk + "fuel")
+            e_exp = c2.number_input("Other expenses (£)", min_value=0.0, value=float(r["expense_cost"]), step=1.0, format="%.2f", key=kk + "exp")
+            e_miles = c1.number_input("Miles", min_value=0.0, value=float(r["miles"]), step=1.0, format="%.1f", key=kk + "miles")
+            e_paid = c2.checkbox("Paid", value=bool(r["paid"]), key=kk + "paid")
+            if st.form_submit_button("Save changes", type="primary"):
+                hrs = calculate_hours(e_st, e_en)
+                if hrs <= 0:
+                    st.error("Start and end time are the same.")
+                else:
+                    hE, mE, gE, _w = compute_shift(e_emp, hrs, e_rate, e_total, e_mil_e, e_tips)
+                    run("""UPDATE shifts SET shift_date=%s, employer=%s, start_time=%s, end_time=%s, hourly_rate=%s,
+                           hours_worked=%s, hourly_earning=%s, mileage_earning=%s, tips=%s, fuel_cost=%s,
+                           expense_cost=%s, gross_earning=%s, miles=%s, paid=%s WHERE id=%s AND user_id=%s""",
+                        (e_date, e_emp, e_st.strftime("%H:%M"), e_en.strftime("%H:%M"), e_rate, round(hrs, 2),
+                         round(hE, 2), round(mE, 2), round(e_tips, 2), round(e_fuel, 2), round(e_exp, 2),
+                         round(gE, 2), round(e_miles, 1), bool(e_paid), int(esel), uid()))
+                    ss.flash = ("success", "Shift updated.")
+                    st.rerun()
+
+    with st.expander("⬇️ Export"):
+        export_df = fdf.drop(columns=["week_start", "deductions", "final"]).copy()
+        export_df["shift_date"] = export_df["shift_date"].dt.date
+        xl = to_excel_bytes({"Shifts": export_df})
+        e1, e2 = st.columns(2)
+        if xl:
+            e1.download_button("📗 Download Excel", xl, f"shifts_{TODAY:%Y%m%d}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            e1.caption("Excel export needs `openpyxl` in requirements.txt.")
+        e2.download_button("📄 Download CSV", export_df.to_csv(index=False).encode(), f"shifts_{TODAY:%Y%m%d}.csv", "text/csv")
+
+    def delete_shift():
+        run("DELETE FROM shifts WHERE id = %s AND user_id = %s", (int(ss.del_sel), uid()))
+        ss.confirm_del_shift = False  # allowed here: callbacks run before widgets are drawn
+        ss.flash = ("success", "Shift deleted.")
+
+    with st.expander("⚠️ Delete a shift"):
+        st.selectbox("Select shift to delete", list(labels), format_func=labels.get, key="del_sel")
+        sure = st.checkbox("Yes, delete this shift permanently", key="confirm_del_shift")
+        st.button("Delete selected shift", disabled=not sure, on_click=delete_shift)
+
+# ==========================================================
+# PAGE: GOGO LEDGER
+# ==========================================================
+elif page == PAGES[2]:
+    hero("🏠 GOGO Rent & Payments", "Wages earned, rent deducted and payments received — with a running balance.")
+    show_flash()
+    start_balance, monthly_rent = float(settings["gogo_start"]), float(settings["gogo_rent"])
+    TYPES = ["Payment Received from Owner", "Rent Deducted by Owner"]
+
+    with st.expander("⚙️ GOGO Settings & automatic rent"):
+        with st.form("gogo_settings"):
+            s1, s2 = st.columns(2)
+            new_rent = s1.number_input("Monthly Rent Amount (£)", min_value=0.0, value=monthly_rent, step=10.0, format="%.2f")
+            new_start = s2.number_input("Starting Balance (£)", min_value=-10000.0, value=start_balance, step=10.0, format="%.2f")
+            a1, a2, a3 = st.columns(3)
+            new_auto = a1.checkbox("Add rent automatically each month", value=bool(settings["auto_rent"]))
+            new_day = a2.number_input("Rent day of month", min_value=1, max_value=28, value=int(settings["rent_day"]))
+            try:
+                since_default = datetime.strptime(str(settings["auto_rent_since"]), "%Y-%m-%d").date()
+            except Exception:
+                since_default = TODAY.replace(day=1)
+            new_since = a3.date_input("Start from month", value=since_default)
+            st.caption("Rent is added the next time the app is opened on/after the rent day (no background job needed).")
+            if st.form_submit_button("Save settings", type="primary"):
+                save_setting("gogo_rent", new_rent); save_setting("gogo_start", new_start)
+                save_setting("auto_rent", int(new_auto)); save_setting("rent_day", int(new_day))
+                save_setting("auto_rent_since", new_since.replace(day=1).isoformat())
+                st.rerun()
+
+    ss.setdefault("trans_amt", 0.0)
+    ss.setdefault("trans_notes", "")
+
+    def on_type_change():
+        ss.trans_amt = load_settings()["gogo_rent"] if ss.trans_type == TYPES[1] else 0.0
+
+    def add_transaction():
+        amt = float(ss.trans_amt)
+        if amt <= 0:
+            ss.flash = ("error", "Enter an amount greater than £0.")
+            return
+        run("INSERT INTO gogo_transactions (user_id, trans_date, trans_type, amount, notes) VALUES (%s,%s,%s,%s,%s)",
+            (uid(), ss.trans_date, "RENT" if ss.trans_type == TYPES[1] else "PAYMENT", round(amt, 2), ss.trans_notes.strip()))
+        ss.trans_amt, ss.trans_notes = 0.0, ""
+        ss.flash = ("success", "Transaction added successfully!")
+
+    ledger = build_ledger(start_balance)
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.subheader("➕ Add transaction")
+        st.selectbox("Transaction Type", TYPES, key="trans_type", on_change=on_type_change)
+        st.date_input("Date", value=TODAY, key="trans_date")
+        st.number_input("Amount (£)", min_value=0.0, step=1.0, format="%.2f", key="trans_amt")
+        st.text_input("Notes (optional)", placeholder="e.g. Cash, bank transfer", key="trans_notes")
+        st.button("Add Transaction", type="primary", on_click=add_transaction)
+    with right:
+        st.subheader("🗓️ Period")
+        preset = st.radio("Show", ["This month", "Last 30 days", "All time", "Custom"], horizontal=True, label_visibility="collapsed")
+        if preset == "This month":
+            start_d, end_d = TODAY.replace(day=1), TODAY
+        elif preset == "Last 30 days":
+            start_d, end_d = TODAY - timedelta(days=30), TODAY
+        elif preset == "All time":
+            if ledger.empty:
+                start_d, end_d = TODAY.replace(day=1), TODAY
+            else:
+                start_d, end_d = ledger["Date"].min().date(), max(TODAY, ledger["Date"].max().date())
+        else:
+            rng = st.date_input("Date range", value=(TODAY.replace(day=1), TODAY))
+            if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+                st.info("Pick an end date.")
+                st.stop()
+            start_d, end_d = rng
+        st.caption(f"Showing {start_d:%d %b %Y} → {end_d:%d %b %Y}")
+
+    if ledger.empty:
+        balance_now, opening, period = start_balance, start_balance, ledger
+    else:
+        dts = ledger["Date"].dt.date
+        balance_now = start_balance + ledger.loc[dts <= TODAY, "Amount"].sum()
+        opening = start_balance + ledger.loc[dts < start_d, "Amount"].sum()
+        period = ledger[(dts >= start_d) & (dts <= end_d)]
+
+    wages = period.loc[period["Category"] == "Wages", "Amount"].sum() if not period.empty else 0.0
+    rent = -period.loc[period["Category"] == "Rent", "Amount"].sum() if not period.empty else 0.0
+    paid = -period.loc[period["Category"] == "Payment", "Amount"].sum() if not period.empty else 0.0
+    net_period = wages - rent - paid
+    closing = opening + net_period
+
+    st.markdown("---")
+    cls, label, amt = ("owed", "Owner currently owes you", balance_now) if balance_now >= 0 else ("owe", "You currently owe owner", abs(balance_now))
+    st.markdown(f'<div class="balance {cls}"><div><div class="b-label">{label}</div><div class="b-value">{gbp(amt)}</div></div>'
+                f'<div class="b-label">as of {TODAY:%d %b %Y}</div></div>', unsafe_allow_html=True)
+
+    st.subheader("Summary for selected period")
+    m = st.columns(3)
+    with m[0]: card("Base wages earned", gbp(wages), "", "green")
+    with m[1]: card("Rent deducted", gbp(rent), "", "red")
+    with m[2]: card("Payments received", gbp(paid), "", "amber")
+    m = st.columns(3)
+    with m[0]: card("Opening balance", gbp(opening), f"before {start_d:%d %b}", "slate")
+    with m[1]: card("Net for period", gbp(net_period), "wages − rent − payments", "green" if net_period >= 0 else "red")
+    with m[2]: card("Closing balance", gbp(closing), f"at {end_d:%d %b}", "indigo")
+    st.markdown("---")
+
+    if ledger.empty:
+        st.info("No GOGO shifts or transactions recorded yet.")
+    else:
+        tab_m, tab_l, tab_x = st.tabs(["📅 Monthly breakdown (with rollover)", "📋 Detailed ledger", "📄 Statement & export"])
+        with tab_m:
+            L = ledger.copy()
+            L["RentAmt"] = (-L["Amount"]).where(L["Category"] == "Rent", 0.0)
+            L["PayAmt"] = (-L["Amount"]).where(L["Category"] == "Payment", 0.0)
+            L["WageAmt"] = L["Amount"].where(L["Category"] == "Wages", 0.0)
+            monthly = L.groupby("Month").agg(Wages=("WageAmt", "sum"), Rent=("RentAmt", "sum"),
+                                              Payments=("PayAmt", "sum"), Net=("Amount", "sum")).reset_index()
+            monthly["Closing"] = start_balance + monthly["Net"].cumsum()
+            monthly["Rollover"] = monthly["Closing"] - monthly["Net"]
+            monthly = monthly[(monthly["Month"] >= pd.Period(start_d, "M")) & (monthly["Month"] <= pd.Period(end_d, "M"))].copy()
+            monthly["Month"] = monthly["Month"].dt.strftime("%b %Y")
+            nn = lambda t: st.column_config.NumberColumn(t, format="%.2f")
+            show_table(monthly[["Month", "Rollover", "Wages", "Rent", "Payments", "Net", "Closing"]], {
+                "Rollover": nn("Rollover in (£)"), "Wages": nn("Wages (£)"), "Rent": nn("Rent (£)"),
+                "Payments": nn("Payments (£)"), "Net": nn("Net (£)"), "Closing": nn("Balance end (£)")})
+        with tab_l:
+            if period.empty:
+                st.info("No entries in the selected period.")
+            else:
+                disp = period.sort_values(["Date", "Order"], ascending=False, kind="mergesort")[["Date", "Details", "Category", "Amount", "Balance"]]
+                show_table(disp, {"Date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
+                                  "Amount": st.column_config.NumberColumn("Amount (£)", format="%.2f"),
+                                  "Balance": st.column_config.NumberColumn("Running balance (£)", format="%.2f")})
+        with tab_x:
+            if period.empty:
+                st.info("Nothing to export for this period.")
+            else:
+                x1, x2 = st.columns(2)
+                if x1.button("📄 Prepare PDF statement"):
+                    ss.pdf_bytes = make_statement_pdf(period, opening, closing, wages, rent, paid, start_d, end_d)
+                    ss.pdf_missing = ss.pdf_bytes is None
+                if ss.get("pdf_missing"):
+                    st.caption("PDF export needs `reportlab` in requirements.txt.")
+                elif ss.get("pdf_bytes"):
+                    st.download_button("⬇️ Download PDF statement", ss.pdf_bytes, f"gogo_statement_{TODAY:%Y%m%d}.pdf", "application/pdf")
+                xl = to_excel_bytes({"Ledger": period.drop(columns=["Order", "ID", "Month"], errors="ignore")})
+                if xl:
+                    x2.download_button("📗 Download ledger (Excel)", xl, f"gogo_ledger_{TODAY:%Y%m%d}.xlsx",
+                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    trans_all = load_trans()
+    with st.expander("✏️ Edit a transaction"):
+        if trans_all.empty:
+            st.info("No transactions yet.")
+        else:
+            tl = {int(r.id): f"{r.trans_date:%d %b %Y} · {r.trans_type} · {gbp(r.amount)}" for r in trans_all.sort_values("trans_date", ascending=False).itertuples()}
+            tsel = st.selectbox("Select transaction", list(tl), format_func=tl.get, key="tx_edit_sel")
+            tr = trans_all[trans_all["id"] == tsel].iloc[0]
+            kk = f"t{tsel}_"
+            with st.form("edit_tx_form"):
+                c1, c2 = st.columns(2)
+                t_type = c1.selectbox("Type", TYPES, index=1 if tr["trans_type"] == "RENT" else 0, key=kk + "type")
+                t_date = c2.date_input("Date", value=tr["trans_date"].date(), key=kk + "date")
+                t_amt = c1.number_input("Amount (£)", min_value=0.0, value=float(tr["amount"]), step=1.0, format="%.2f", key=kk + "amt")
+                t_notes = c2.text_input("Notes", value=tr["notes"] if isinstance(tr["notes"], str) else "", key=kk + "notes")
+                if st.form_submit_button("Save changes", type="primary"):
+                    run("UPDATE gogo_transactions SET trans_date=%s, trans_type=%s, amount=%s, notes=%s WHERE id=%s AND user_id=%s",
+                        (t_date, "RENT" if t_type == TYPES[1] else "PAYMENT", round(t_amt, 2), t_notes.strip(), int(tsel), uid()))
+                    ss.flash = ("success", "Transaction updated.")
+                    st.rerun()
+
+    def delete_tx():
+        run("DELETE FROM gogo_transactions WHERE id = %s AND user_id = %s", (int(ss.tx_del_sel), uid()))
+        ss.confirm_del_tx = False
+        ss.flash = ("success", "Transaction deleted.")
+
+    with st.expander("⚠️ Delete a transaction"):
+        if trans_all.empty:
+            st.info("No transactions recorded yet.")
+        else:
+            dl = {int(r.id): f"{r.trans_date:%d %b %Y} · {r.trans_type} · {gbp(r.amount)}" for r in trans_all.sort_values("trans_date", ascending=False).itertuples()}
+            st.selectbox("Select transaction to delete", list(dl), format_func=dl.get, key="tx_del_sel")
+            sure = st.checkbox("Yes, delete this transaction permanently", key="confirm_del_tx")
+            st.button("Delete transaction", disabled=not sure, on_click=delete_tx)
+
+# ==========================================================
+# PAGE: UNPAID & OWED
+# ==========================================================
+elif page == PAGES[3]:
+    hero("💼 Unpaid & Owed", "See exactly what each employer still owes you.")
+    show_flash()
+    shifts = load_shifts()
+    ledger = build_ledger(float(settings["gogo_start"]))
+    gogo_bal = float(settings["gogo_start"]) + (ledger.loc[ledger["Date"].dt.date <= TODAY, "Amount"].sum() if not ledger.empty else 0.0)
+
+    unpaid = shifts[~shifts["paid"]] if not shifts.empty else pd.DataFrame()
+    if not ALL_EMPLOYERS:
+        st.info("Add an employer on the Enter Rota page first.")
+        st.stop()
+    for _start in range(0, len(ALL_EMPLOYERS), 4):
+        _chunk = ALL_EMPLOYERS[_start:_start + 4]
+        cols = st.columns(len(_chunk))
+        for i, emp in enumerate(_chunk):
+            with cols[i]:
+                sub = unpaid[unpaid["employer"] == emp] if not unpaid.empty else unpaid
+                tot = float(sub["hourly_earning"].sum()) if not sub.empty else 0.0
+                if emp == "GOGO":
+                    card("GOGO (ledger balance)", gbp(gogo_bal),
+                         f"{len(sub)} shift(s) marked unpaid · {gbp(tot)}", "green" if gogo_bal >= 0 else "red")
+                else:
+                    card(emp, gbp(tot), f"{len(sub)} unpaid shift(s)", "amber" if tot > 0 else "slate")
+
+    st.markdown("---")
+    st.subheader("Unpaid shifts")
+    st.caption("Amounts owed are **hourly pay only** — mileage and tips are paid on the day.")
+    if unpaid.empty:
+        st.success("🎉 Nothing outstanding — every shift is marked as paid.")
+    else:
+        ed = unpaid[["id", "shift_date", "employer", "start_time", "end_time", "hours_worked", "hourly_earning"]].copy()
+        ed.insert(0, "Paid?", False)
+        edited = st.data_editor(ed, hide_index=True, key="unpaid_editor",
+                                disabled=[c for c in ed.columns if c != "Paid?"],
+                                column_config={"id": None,
+                                               "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
+                                               "employer": "Location", "start_time": "Start", "end_time": "End",
+                                               "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
+                                               "hourly_earning": st.column_config.NumberColumn("Owed – hourly pay (£)", format="%.2f")})
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Mark ticked as paid", type="primary"):
+            ids = edited.loc[edited["Paid?"], "id"].astype(int).tolist()
+            if ids:
+                run("UPDATE shifts SET paid = TRUE WHERE id = ANY(%s) AND user_id = %s", (ids, uid()))
+                ss.flash = ("success", f"Marked {len(ids)} shift(s) as paid.")
+                st.rerun()
+            else:
+                st.warning("Tick at least one shift first.")
+        emp_pick = c2.selectbox("Or mark everything paid for", ALL_EMPLOYERS, key="mark_all_emp")
+        if c2.button(f"Mark all {emp_pick} as paid"):
+            run("UPDATE shifts SET paid = TRUE WHERE employer = %s AND paid = FALSE AND user_id = %s", (emp_pick, uid()))
+            ss.flash = ("success", f"All {emp_pick} shifts marked as paid.")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("📄 Employer statement (PDF)")
+    st.caption("Every shift with its **Paid / Unpaid** status. Amounts are hourly pay only.")
+    with st.expander("📱 Employer WhatsApp numbers"):
+        st.caption("Type UK numbers like 07123 456789 or international ones like +44 7123 456789.")
+        with st.form("wa_numbers_form"):
+            wc = st.columns(3)
+            new_nums = {}
+            for i, emp in enumerate(ALL_EMPLOYERS):
+                cur = normalize_phone(settings.get(f"wa_{emp}", ""))
+                new_nums[emp] = wc[i % 3].text_input(emp, value=f"+{cur}" if cur else "", placeholder="07… or +44…")
+            if st.form_submit_button("Save numbers", type="primary"):
+                bad = [e for e, v in new_nums.items() if v.strip() and not normalize_phone(v)]
+                if bad:
+                    st.error(f"Couldn't read the number for: {', '.join(bad)}")
+                else:
+                    for e, v in new_nums.items():
+                        save_setting(f"wa_{e}", normalize_phone(v))
+                    ss.flash = ("success", "WhatsApp numbers saved.")
+                    st.rerun()
+    if shifts.empty:
+        st.info("No shifts recorded yet.")
+    else:
+        s1, s2, s3 = st.columns(3)
+        st_emp = s1.selectbox("Employer", ALL_EMPLOYERS, key="stmt_emp")
+        emp_sh = shifts[shifts["employer"] == st_emp]
+        if emp_sh.empty:
+            st.info(f"No {st_emp} shifts recorded yet.")
+        else:
+            lo, hi = emp_sh["shift_date"].min().date(), max(TODAY, emp_sh["shift_date"].max().date())
+            rng = s2.date_input("Period", value=(lo, hi), key=f"stmt_rng_{st_emp}")
+            flt = s3.radio("Include", ["All shifts", "Unpaid only", "Paid only"], key="stmt_filter")
+            if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+                st.info("Pick an end date for the period.")
+            else:
+                dts = emp_sh["shift_date"].dt.date
+                sel = emp_sh[(dts >= rng[0]) & (dts <= rng[1])]
+                if flt == "Unpaid only":
+                    sel = sel[~sel["paid"]]
+                elif flt == "Paid only":
+                    sel = sel[sel["paid"]]
+                sel = sel.sort_values("shift_date")
+                if sel.empty:
+                    st.info("No shifts match these choices.")
+                else:
+                    paid_amt = float(sel.loc[sel["paid"], "hourly_earning"].sum())
+                    unpaid_amt = float(sel.loc[~sel["paid"], "hourly_earning"].sum())
+                    q = st.columns(3)
+                    with q[0]: card("Total hourly pay", gbp(paid_amt + unpaid_amt), f"{len(sel)} shift(s)", "indigo")
+                    with q[1]: card("Paid", gbp(paid_amt), "", "green")
+                    with q[2]: card("Unpaid", gbp(unpaid_amt), "amount owed", "amber" if unpaid_amt > 0 else "slate")
+
+                    prev = sel[["shift_date", "start_time", "end_time", "hours_worked", "hourly_rate", "hourly_earning", "paid"]].copy()
+                    prev["status"] = prev["paid"].map({True: "✅ Paid", False: "⏳ Unpaid"})
+                    show_table(prev.drop(columns=["paid"]), {
+                        "shift_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
+                        "start_time": "Start", "end_time": "End",
+                        "hours_worked": st.column_config.NumberColumn("Hours", format="%.2f"),
+                        "hourly_rate": st.column_config.NumberColumn("Rate (£)", format="%.2f"),
+                        "hourly_earning": st.column_config.NumberColumn("Hourly pay (£)", format="%.2f"),
+                        "status": "Status"})
+
+                    sig = (st_emp, str(rng[0]), str(rng[1]), flt, len(sel), round(unpaid_amt, 2))
+                    if st.button("📄 Prepare PDF statement", key="prep_emp_pdf"):
+                        ss.emp_pdf = {"sig": sig, "bytes": make_employer_pdf(st_emp, sel, rng[0], rng[1], flt)}
+                    pdf = ss.get("emp_pdf")
+                    if pdf and pdf["sig"] == sig:
+                        if pdf["bytes"] is None:
+                            st.caption("PDF export needs `reportlab` in requirements.txt.")
+                        else:
+                            st.download_button("⬇️ Download PDF statement", pdf["bytes"],
+                                               f"{st_emp.lower()}_statement_{TODAY:%Y%m%d}.pdf", "application/pdf")
+
+                    st.markdown("#### 💬 Send via WhatsApp")
+                    num = normalize_phone(settings.get(f"wa_{st_emp}", ""))
+                    if num:
+                        st.caption(f"Opens a chat with {st_emp} (+{num}) with the message below already typed.")
+                    else:
+                        st.info(f"No WhatsApp number saved for {st_emp}. WhatsApp will let you pick the contact — "
+                                "or save a number in “Employer WhatsApp numbers” above.")
+                    msg_key = "wa_msg_" + hashlib.md5(str(sig).encode()).hexdigest()[:8]
+                    wa_msg = st.text_area("Message (edit it if you like)", value=build_wa_message(st_emp, sel, rng[0], rng[1]),
+                                          height=230, key=msg_key)
+                    from urllib.parse import quote
+                    wa_url = f"https://wa.me/{num}?text={quote(wa_msg)}" if num else f"https://wa.me/?text={quote(wa_msg)}"
+                    w1, w2 = st.columns(2)
+                    with w1:
+                        try:
+                            st.link_button("💬 Open WhatsApp with message", wa_url, type="primary")
+                        except AttributeError:   # very old Streamlit
+                            st.markdown(f'<a href="{wa_url}" target="_blank">💬 Open WhatsApp with message</a>', unsafe_allow_html=True)
+                    with w2:
+                        if pdf and pdf["sig"] == sig and pdf["bytes"] is not None:
+                            import streamlit.components.v1 as components
+                            components.html(wa_share_html(pdf["bytes"], wa_msg, f"{st_emp.lower()}_statement_{TODAY:%Y%m%d}.pdf"), height=95)
+                        else:
+                            st.caption("Press **Prepare PDF statement** above to enable “Share PDF + message”.")
+                    st.caption("WhatsApp links can't attach files. Either download the PDF and add it with the 📎 paperclip, "
+                               "or try “Share PDF + message” (works on many phones, but not every browser allows it).")
+
+# ==========================================================
+# PAGE: GOALS & INSIGHTS
+# ==========================================================
+elif page == PAGES[4]:
+    hero("🎯 Goals & Insights", "Targets, trends and where your time pays best.")
+    shifts = load_shifts()
+
+    with st.expander("🎯 Set earnings goals (net, after fuel & expenses)"):
+        with st.form("goals_form"):
+            g1, g2 = st.columns(2)
+            gw = g1.number_input("Weekly goal (£)", min_value=0.0, value=float(settings["goal_weekly"]), step=10.0, format="%.2f")
+            gm = g2.number_input("Monthly goal (£)", min_value=0.0, value=float(settings["goal_monthly"]), step=50.0, format="%.2f")
+            if st.form_submit_button("Save goals", type="primary"):
+                save_setting("goal_weekly", gw); save_setting("goal_monthly", gm)
+                st.rerun()
+
+    if shifts.empty:
+        st.info("Add some shifts to see goals and insights.")
+        st.stop()
+
+    shifts = shifts.copy()
+    shifts["net"] = shifts["gross_earning"] - shifts["fuel_cost"] - shifts["expense_cost"]
+    d = shifts["shift_date"].dt.date
+    wk_start = TODAY - timedelta(days=TODAY.weekday())
+    week_net = shifts.loc[d >= wk_start, "net"].sum()
+    month_net = shifts.loc[d >= TODAY.replace(day=1), "net"].sum()
+
+    g1, g2 = st.columns(2)
+    with g1: progress_card("This week (net)", week_net, float(settings["goal_weekly"]), "indigo")
+    with g2: progress_card("This month (net)", month_net, float(settings["goal_monthly"]), "teal")
+
+    st.markdown("---")
+    st.subheader("📆 Month on month")
+    shifts["ym"] = shifts["shift_date"].dt.to_period("M")
+    mon = shifts.groupby("ym")["net"].sum().sort_index()
+    cur_p = pd.Period(TODAY, "M")
+    prev_p = cur_p - 1
+    cur_v, prev_v = float(mon.get(cur_p, 0.0)), float(mon.get(prev_p, 0.0))
+    if prev_v > 0:
+        chg = (cur_v - prev_v) / prev_v * 100
+        arrow = "▲" if chg >= 0 else "▼"
+        delta_txt, tone = f"{arrow} {abs(chg):.0f}% vs last month", ("green" if chg >= 0 else "red")
+    else:
+        delta_txt, tone = "no data last month", "slate"
+    m1, m2, m3 = st.columns(3)
+    with m1: card(f"{cur_p.strftime('%B %Y')}", gbp(cur_v), "this month so far", "indigo")
+    with m2: card(f"{prev_p.strftime('%B %Y')}", gbp(prev_v), "last month", "slate")
+    with m3: card("Change", delta_txt, "", tone)
+    last12 = mon.tail(12)
+    last12.index = last12.index.strftime("%Y-%m")
+    st.bar_chart(last12, color="#6366f1")
+
+    st.markdown("---")
+    st.subheader("⏱️ What pays best?")
+    t1, t2 = st.tabs(["By weekday", "By employer"])
+    with t1:
+        wd = shifts.groupby(shifts["shift_date"].dt.weekday).agg(net=("net", "sum"), hrs=("hours_worked", "sum"))
+        wd["£/hour"] = wd["net"] / wd["hrs"].replace(0, pd.NA)
+        wd = wd.reindex(range(7))
+        wd.index = list(calendar.day_abbr)
+        st.caption("Average net £ per hour, by day of the week")
+        st.bar_chart(wd["£/hour"].astype(float).fillna(0), color="#14b8a6")
+    with t2:
+        em = shifts.groupby("employer").agg(net=("net", "sum"), hrs=("hours_worked", "sum"), shifts=("id", "count")).reset_index()
+        em["£/hour"] = em["net"] / em["hrs"].replace(0, pd.NA)
+        em = em.sort_values("£/hour", ascending=False)
+        show_table(em, {"employer": "Employer", "net": st.column_config.NumberColumn("Net total (£)", format="%.2f"),
+                        "hrs": st.column_config.NumberColumn("Hours", format="%.2f"), "shifts": "Shifts",
+                        "£/hour": st.column_config.NumberColumn("Net £/hour", format="%.2f")})
+
+# ==========================================================
+# PAGE: CALENDAR
+# ==========================================================
+elif page == PAGES[5]:
+    hero("📅 Calendar", "Your shifts laid out month by month.")
+    shifts = load_shifts()
     c1, c2 = st.columns(2)
-    year = int(c1.number_input("Year", min_value=2020, max_value=2100, value=a.today.year, step=1, key="tj_cal_year"))
-    month = c2.selectbox("Month", list(range(1, 13)), index=a.today.month - 1,
-                         format_func=lambda m: calendar.month_name[m], key="tj_cal_month")
-    sub = df[(df["trade_date"].dt.year == year) & (df["trade_date"].dt.month == month)]
-    by_day = {d: g for d, g in sub.groupby(sub["trade_date"].dt.date)}
-    sign = lambda v: ("+" if v > 0 else "") + a.gbp(v)
+    year = int(c1.number_input("Year", min_value=2020, max_value=2100, value=TODAY.year, step=1))
+    month = c2.selectbox("Month", list(range(1, 13)), index=TODAY.month - 1, format_func=lambda m: calendar.month_name[m])
+
+    by_day = {}
+    month_total, month_hours = 0.0, 0.0
+    if not shifts.empty:
+        sub = shifts[(shifts["shift_date"].dt.year == year) & (shifts["shift_date"].dt.month == month)]
+        for r in sub.itertuples():
+            by_day.setdefault(r.shift_date.date(), []).append(r)
+        month_total, month_hours = float(sub["gross_earning"].sum()), float(sub["hours_worked"].sum())
 
     cells = [f'<div class="cal-h">{h}</div>' for h in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]]
     for week in calendar.monthcalendar(year, month):
@@ -244,411 +1739,706 @@ def render_calendar(a, df, counts):
                 cells.append('<div class="cal-d empty"></div>')
                 continue
             dd = date(year, month, dn)
-            g = by_day.get(dd)
-            style, inner = "", f'<div class="cal-n">{dn}</div>'
-            if g is not None:
-                net = float(g["net"].sum())
-                style = f' style="background:{"rgba(16,185,129,.20)" if net >= 0 else "rgba(239,68,68,.20)"}"'
-                for _, t in g.head(3).iterrows():
-                    v = float(t["net"])
-                    inner += (f'<span class="chip" style="background:{"#10b981" if v >= 0 else "#ef4444"}">'
-                              f'{html.escape(str(t["symbol"]))} {sign(v)}</span>')
-                if len(g) > 3:
-                    inner += f'<div class="cal-t">+{len(g) - 3} more</div>'
-                n_shots = sum(counts.get(int(i), 0) for i in g["id"])
-                inner += f'<div class="cal-t">{sign(net)}' + (f" · 📷 {n_shots}" if n_shots else "") + "</div>"
-            cells.append(f'<div class="cal-d{" today" if dd == a.today else ""}"{style}>{inner}</div>')
+            items = by_day.get(dd, [])
+            inner = f'<div class="cal-n">{dn}</div>'
+            for it in items:
+                emp = html.escape(str(it.employer))
+                inner += f'<span class="chip" style="background:{emp_color(it.employer)}">{emp} {html.escape(str(it.start_time))}-{html.escape(str(it.end_time))}</span>'
+            if items:
+                inner += f'<div class="cal-t">{gbp(sum(i.gross_earning for i in items))}</div>'
+            cells.append(f'<div class="cal-d{" today" if dd == TODAY else ""}">{inner}</div>')
     st.markdown('<div class="cal-wrap"><div class="cal">' + "".join(cells) + "</div></div>", unsafe_allow_html=True)
+
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    k1, k2, k3 = st.columns(3)
+    with k1: card("Shifts this month", f"{sum(len(v) for v in by_day.values())}", f"{calendar.month_name[month]} {year}", "slate")
+    with k2: card("Hours", f"{month_hours:.2f}", "", "indigo")
+    with k3: card("Gross earnings", gbp(month_total), "", "green")
 
-    if sub.empty:
-        st.info("No trades in this month.")
-        return
-    day_net = sub.groupby(sub["trade_date"].dt.date)["net"].sum()
-    k = st.columns(4)
-    with k[0]: a.card("Month P&L", a.gbp(sub["net"].sum()), f"{len(sub)} trade(s)", "green" if sub["net"].sum() >= 0 else "red")
-    with k[1]: a.card("Green / red days", f"{int((day_net > 0).sum())} / {int((day_net < 0).sum())}", f"{len(day_net)} trading day(s)", "indigo")
-    with k[2]: a.card("Best day", a.gbp(day_net.max()), f"{day_net.idxmax():%a %d %b}", "green")
-    with k[3]: a.card("Worst day", a.gbp(day_net.min()), f"{day_net.idxmin():%a %d %b}", "red")
+# ==========================================================
+# PAGE: TAX & MILEAGE
+# ==========================================================
+elif page == PAGES[6]:
+    hero("🧾 Tax & Mileage", "UK tax-year summary (6 April – 5 April) with rough tax and mileage figures.")
+    st.warning("These are **estimates only** for a self-employed sole trader. They ignore other income, "
+               "allowances, student loans etc. Always check current rates on gov.uk or with an accountant.")
+    shifts = load_shifts()
 
-    days = sorted(by_day)
-    st.subheader("Open a day")
-    pick = st.selectbox("Day", days, index=len(days) - 1, key=f"tj_cal_day_{year}_{month}", label_visibility="collapsed",
-                        format_func=lambda d: f"{d:%a %d %b} · {sign(float(by_day[d]['net'].sum()))} · {len(by_day[d])} trade(s)")
-    for _, r in by_day[pick].iterrows():
-        render_trade(a, r, "cal")
+    with st.expander("⚙️ Tax & mileage rates (editable)"):
+        with st.form("tax_form"):
+            keys = [("tax_pa", "Personal allowance (£)"), ("tax_basic_upper", "Basic-rate limit (£)"),
+                    ("tax_add_threshold", "Additional-rate threshold (£)"), ("tax_basic_rate", "Basic rate (%)"),
+                    ("tax_higher_rate", "Higher rate (%)"), ("tax_add_rate", "Additional rate (%)"),
+                    ("ni_lower", "Class 4 NI lower limit (£)"), ("ni_upper", "Class 4 NI upper limit (£)"),
+                    ("ni_main", "Class 4 NI main rate (%)"), ("ni_top", "Class 4 NI rate above upper (%)"),
+                    ("mile_rate_1", "Mileage rate up to threshold (£/mile)"), ("mile_rate_2", "Mileage rate above (£/mile)"),
+                    ("mile_threshold", "Mileage threshold (miles)")]
+            cols = st.columns(3)
+            newv = {k: cols[i % 3].number_input(lbl, min_value=0.0, value=float(settings[k]), step=0.01 if "rate" in k and "tax" not in k else 1.0, format="%.2f", key="tx_" + k)
+                    for i, (k, lbl) in enumerate(keys)}
+            if st.form_submit_button("Save rates", type="primary"):
+                for k, v in newv.items():
+                    save_setting(k, v)
+                st.rerun()
 
+    if shifts.empty:
+        st.info("No shifts yet.")
+        st.stop()
 
-def render_history(a, df, counts):
-    """Searchable trade history with screenshots, newest first, paged."""
-    h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
-    q = h1.text_input("Search symbol, setup, tags or notes", key="tj_h_q")
-    only = h2.checkbox("Only with screenshots", key="tj_h_only")
-    order = h3.selectbox("Sort", ["Newest first", "Oldest first", "Best P&L", "Worst P&L"], key="tj_h_sort")
-    per = h4.selectbox("Per page", [5, 10, 20], index=1, key="tj_h_per")
-    v = df.copy()
-    v["shots"] = v["id"].map(counts).fillna(0).astype(int)
-    if q.strip():
-        mask = False
-        for c in ("symbol", "setup", "tags", "notes"):
-            mask = mask | v[c].str.contains(q.strip(), case=False, regex=False)
-        v = v[mask]
-    if only:
-        v = v[v["shots"] > 0]
-    if v.empty:
-        st.info("No trades match your search.")
-        return
-    by = {"Newest first": ("trade_date", False), "Oldest first": ("trade_date", True),
-          "Best P&L": ("net", False), "Worst P&L": ("net", True)}[order]
-    v = v.sort_values([by[0], "id"], ascending=[by[1], by[1]])
-    pages = max(1, math.ceil(len(v) / per))
-    page = 1
-    if pages > 1:
-        page = int(st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key=f"tj_h_page_{pages}_{per}"))
-    st.caption(f"{len(v)} trade(s) · page {page} of {pages}")
-    for _, r in v.iloc[(page - 1) * per: page * per].iterrows():
-        render_trade(a, r, "hist")
+    years = sorted({uk_tax_year(x.date()) for x in shifts["shift_date"]}, reverse=True)
+    cur_ty = uk_tax_year(TODAY)
+    if cur_ty not in years:
+        years.insert(0, cur_ty)
+    f1, f2 = st.columns(2)
+    ty = f1.selectbox("Tax year", years, index=years.index(cur_ty), format_func=lambda y: f"{y}/{str(y + 1)[2:]}")
+    incl = f2.multiselect("Employers included (untick any that are PAYE)", ALL_EMPLOYERS, default=ALL_EMPLOYERS)
+    method = st.radio("Vehicle costs method", ["Actual fuel & expenses", "HMRC mileage allowance + other expenses"], horizontal=True)
 
+    s_d, e_d = date(ty, 4, 6), date(ty + 1, 4, 5)
+    dts = shifts["shift_date"].dt.date
+    ysh = shifts[(dts >= s_d) & (dts <= e_d) & (shifts["employer"].isin(incl))]
+    if ysh.empty:
+        st.info("No shifts in this tax year for the selected employers.")
+        st.stop()
 
-# ---------- the page ----------
-def render(a):
-    """`a` is a namespace of helpers from the main app (uid, run, query_df, hero, card, show_table,
-    gbp, show_flash, today, settings, save_setting, to_excel_bytes)."""
-    ss = st.session_state
-    a.hero("📈 Trading Journal", "Log every trade, track your edge and spot the habits that cost you money.")
-    a.show_flash()
+    gross = float(ysh["gross_earning"].sum())
+    fuel, other = float(ysh["fuel_cost"].sum()), float(ysh["expense_cost"].sum())
+    total_miles = float(ysh["miles"].sum())
+    thr = settings["mile_threshold"]
+    allowance = min(total_miles, thr) * settings["mile_rate_1"] + max(0.0, total_miles - thr) * settings["mile_rate_2"]
+    expenses = (fuel + other) if method.startswith("Actual") else (allowance + other)
+    profit = max(0.0, gross - expenses)
+    tax, ni = est_income_tax(profit, settings), est_class4_ni(profit, settings)
+    total_due = tax + ni
 
-    capital = float(a.settings.get("tj_capital", 10000.0))
-    with st.expander("⚙️ Journal settings"):
-        new_cap = st.number_input("Starting capital (£)", min_value=0.0, value=capital, step=500.0, format="%.2f", key="tj_cap_in")
-        if st.button("Save starting capital"):
-            a.save_setting("tj_capital", new_cap)
-            ss.flash = ("success", "Starting capital saved.")
-            st.rerun()
+    st.markdown("---")
+    st.subheader(f"Tax year {ty}/{str(ty + 1)[2:]}")
+    a = st.columns(4)
+    with a[0]: card("Gross income", gbp(gross), f"{len(ysh)} shifts", "indigo")
+    with a[1]: card("Allowable expenses", gbp(expenses), method.split(" +")[0], "red")
+    with a[2]: card("Taxable profit", gbp(profit), "", "teal")
+    with a[3]: card("Est. tax + NI", gbp(total_due), f"≈ {total_due / profit * 100:.0f}% of profit" if profit else "", "amber")
+    b = st.columns(3)
+    with b[0]: card("Income tax (est.)", gbp(tax), "", "slate")
+    with b[1]: card("Class 4 NI (est.)", gbp(ni), "", "slate")
+    with b[2]: card("Take-home (est.)", gbp(profit - total_due), "profit − tax − NI", "green")
 
-    raw = load_trades(a)
-    ss.setdefault("tj_ver", 0)
-    ss.setdefault("tj_up_ver", 0)
-    # clean up screenshots whose trade no longer exists (for example after restoring a backup)
-    a.run("DELETE FROM trading_journal_shots WHERE user_id = %s AND trade_id NOT IN "
-          "(SELECT id FROM trading_journal WHERE user_id = %s)", (a.uid(), a.uid()))
-    counts = shot_counts(a)
+    st.markdown("---")
+    st.subheader("🚗 Mileage")
+    mm = st.columns(4)
+    with mm[0]: card("Miles driven", f"{total_miles:,.1f}", "logged on shifts", "indigo")
+    with mm[1]: card("HMRC allowance", gbp(allowance), f"{settings['mile_rate_1'] * 100:.0f}p/{settings['mile_rate_2'] * 100:.0f}p per mile", "teal")
+    with mm[2]: card("Actual fuel spent", gbp(fuel), "", "red")
+    better = allowance - fuel
+    with mm[3]: card("Allowance vs fuel", gbp(better), "allowance claim is better" if better > 0 else "actual fuel is better", "green" if better > 0 else "amber")
+    if total_miles > 0:
+        mm2 = st.columns(2)
+        with mm2[0]: card("Mileage earned from employers", gbp(ysh["mileage_earning"].sum()), f"{gbp(ysh['mileage_earning'].sum() / total_miles)} per mile", "teal")
+        with mm2[1]: card("Profit per mile", gbp((gross - fuel - other) / total_miles), "gross − fuel − expenses", "indigo")
+    else:
+        st.caption("Log **Miles driven** when entering shifts to unlock per-mile figures.")
 
-    # ----- filters (apply to Dashboard and Analytics) -----
-    df = pd.DataFrame()
-    if not raw.empty:
-        full = enrich(raw)
-        with st.expander("🔎 Filters (Dashboard, Calendar, History & Analytics)"):
-            lo, hi = full["trade_date"].min().date(), max(a.today, full["trade_date"].max().date())
-            rng = st.date_input("Date range", value=(lo, hi), min_value=lo, max_value=hi, key="tj_rng")
-            f1, f2, f3, f4 = st.columns(4)
-            syms = f1.multiselect("Symbols", sorted(full["symbol"].unique()), key="tj_f_sym")
-            setups = f2.multiselect("Setups", sorted(s for s in full["setup"].unique() if s), key="tj_f_setup")
-            moods = f3.multiselect("Mood", sorted(full["mood"].unique()), key="tj_f_mood")
-            side_f = f4.radio("Side", ["Both", "Long", "Short"], horizontal=True, key="tj_f_side")
-        df = full
-        if isinstance(rng, (tuple, list)) and len(rng) == 2:
-            df = df[(df["trade_date"].dt.date >= rng[0]) & (df["trade_date"].dt.date <= rng[1])]
-        if syms:
-            df = df[df["symbol"].isin(syms)]
-        if setups:
-            df = df[df["setup"].isin(setups)]
-        if moods:
-            df = df[df["mood"].isin(moods)]
-        if side_f != "Both":
-            df = df[df["side"] == side_f]
-        df = df.reset_index(drop=True)
+# ==========================================================
+# PAGE: PERSONAL FINANCE & EXPENSES
+# ==========================================================
+elif page == PAGES[7]:
+    hero("💰 Personal Finance & Expenses",
+         "See what you earn, what you spend and what you keep — and test budget scenarios by switching categories on and off.")
+    show_flash()
 
-    t_dash, t_cal, t_log, t_hist, t_trades, t_an, t_io = st.tabs(
-        ["📊 Dashboard", "📅 Calendar", "➕ Log trade", "🖼️ History", "🧾 Edit trades", "🔬 Analytics", "📥 Import & export"])
+    ss.setdefault("fin_ver", 0)
+    ss.setdefault("fin_amt", 0.0)
+    ss.setdefault("fin_notes", "")
+    ss.setdefault("fin_repeat", 0)
+    for _i in range(len(EXPENSE_CATS)):
+        ss.setdefault(f"fin_cat_{_i}", True)
 
-    # ================= dashboard =================
-    with t_dash:
-        if raw.empty:
-            st.info("No trades yet. Log your first one in the **Log trade** tab.")
-        elif df.empty:
-            st.warning("No trades match these filters.")
+    def set_all_cats(flag):
+        for i in range(len(EXPENSE_CATS)):
+            ss[f"fin_cat_{i}"] = flag
+
+    def add_expense():
+        amt = float(ss.fin_amt)
+        if amt <= 0:
+            ss.flash = ("error", "Enter an amount greater than £0.")
+            return
+        reps = int(ss.fin_repeat)
+        base = (ss.fin_notes or "").strip()
+        for i in range(reps + 1):
+            note = base if reps == 0 else f"{base} (recurring {i + 1}/{reps + 1})".strip()
+            run("INSERT INTO personal_expenses (user_id, expense_date, category, amount, notes) VALUES (%s,%s,%s,%s,%s)",
+                (uid(), add_months(ss.fin_date, i), ss.fin_cat, round(amt, 2), note))
+        ss.fin_amt, ss.fin_notes, ss.fin_repeat = 0.0, "", 0
+        ss.flash = ("success", f"Added {reps + 1} expense(s) to {ss.fin_cat}." if reps else f"Added {gbp(amt)} to {ss.fin_cat}.")
+
+    shifts = load_shifts()
+    expenses = load_expenses()
+
+    # ---------- period ----------
+    mode = st.radio("Period", ["This month", "Last month", "Pick a month", "Custom range"], horizontal=True, key="fin_mode")
+    if mode == "This month":
+        s_d, e_d = month_bounds(TODAY.year, TODAY.month)
+    elif mode == "Last month":
+        pm = add_months(TODAY.replace(day=1), -1)
+        s_d, e_d = month_bounds(pm.year, pm.month)
+    elif mode == "Pick a month":
+        c1, c2 = st.columns(2)
+        yr = int(c1.number_input("Year", min_value=2020, max_value=2100, value=TODAY.year, step=1, key="fin_year"))
+        mo = c2.selectbox("Month", list(range(1, 13)), index=TODAY.month - 1,
+                          format_func=lambda m: calendar.month_name[m], key="fin_month")
+        s_d, e_d = month_bounds(yr, mo)
+    else:
+        rng = st.date_input("Date range", value=month_bounds(TODAY.year, TODAY.month), key="fin_range")
+        if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+            st.info("Pick an end date.")
+            st.stop()
+        s_d, e_d = rng
+    period_label = f"{s_d:%d %b %Y} → {e_d:%d %b %Y}"
+
+    with st.expander("⚙️ Earnings options"):
+        basis = st.radio("Earnings basis", ["Gross earnings", "Net of fuel & expenses logged on shifts"], key="fin_basis")
+        only_paid = st.checkbox("Count only shifts marked as paid", key="fin_only_paid")
+        st.caption("Earnings come straight from your shifts for the selected period (hourly + mileage + tips).")
+    use_net = basis.startswith("Net")
+
+    # ---------- category toggles ----------
+    st.markdown("---")
+    st.subheader("🎛️ Budget scenario")
+    st.caption("Untick a category to leave it out — your totals and savings update straight away.")
+    tcols = st.columns(4)
+    for i, c in enumerate(EXPENSE_CATS):
+        tcols[i % 4].checkbox(f"{CAT_ICONS[c]} {c}", key=f"fin_cat_{i}")
+    bb1, bb2, _sp = st.columns([1, 1, 3])
+    bb1.button("Select all", on_click=set_all_cats, args=(True,))
+    bb2.button("Clear all", on_click=set_all_cats, args=(False,))
+    active = [c for i, c in enumerate(EXPENSE_CATS) if ss[f"fin_cat_{i}"]]
+
+    # ---------- numbers ----------
+    if expenses.empty:
+        exp_p = expenses
+    else:
+        _d = expenses["expense_date"].dt.date
+        exp_p = expenses[(_d >= s_d) & (_d <= e_d)]
+
+    spend = {c: 0.0 for c in EXPENSE_CATS}
+    cnt = {c: 0 for c in EXPENSE_CATS}
+    if not exp_p.empty:
+        g = exp_p.groupby("category")["amount"].agg(["sum", "count"])
+        for c in EXPENSE_CATS:
+            if c in g.index:
+                spend[c], cnt[c] = float(g.loc[c, "sum"]), int(g.loc[c, "count"])
+
+    all_total = sum(spend.values())
+    counted_total = sum(spend[c] for c in active)
+    excluded_total = all_total - counted_total
+    earn, n_shifts = earnings_in(shifts, s_d, e_d, use_net, only_paid)
+    saved = earn - counted_total
+    saved_all = earn - all_total
+    rate = saved / earn * 100 if earn > 0 else None
+    good = saved >= 0
+
+    st.markdown("---")
+    st.markdown(
+        f'<div class="balance {"owed" if good else "owe"}"><div>'
+        f'<div class="b-label">{"Money saved" if good else "Overspent"} · {period_label}</div>'
+        f'<div class="b-value">{"▲" if good else "▼"} {gbp(abs(saved))}</div></div>'
+        f'<div class="b-label">{len(active)} of {len(EXPENSE_CATS)} categories counted</div></div>',
+        unsafe_allow_html=True)
+
+    r1 = st.columns(4)
+    with r1[0]: card("Earnings", gbp(earn), f"{n_shifts} shift(s) · {'net' if use_net else 'gross'}", "indigo")
+    with r1[1]: card("Counted expenses", gbp(counted_total), f"{sum(cnt[c] for c in active)} entries", "red" if counted_total > 0 else "slate")
+    with r1[2]: card("Saved" if good else "Overspent", gbp(saved), "▲ in the green" if good else "▼ spending exceeds earnings", "green" if good else "red")
+    with r1[3]: card("Savings rate", f"{rate:.0f}%" if rate is not None else "n/a", "of earnings kept", "green" if good else "red")
+
+    counted_spend = {c: spend[c] for c in active if spend[c] > 0}
+    big_name = max(counted_spend, key=counted_spend.get) if counted_spend else None
+    r2 = st.columns(3)
+    with r2[0]: card("Excluded by scenario", gbp(excluded_total), f"{len(EXPENSE_CATS) - len(active)} categor(ies) switched off", "slate")
+    with r2[1]: card("Saved if everything counted", gbp(saved_all), f"{gbp(saved - saved_all)} difference with your scenario", "green" if saved_all >= 0 else "red")
+    with r2[2]: card("Biggest counted category", f"{CAT_ICONS[big_name]} {big_name}" if big_name else "—", gbp(counted_spend[big_name]) if big_name else "no spending yet", "amber")
+
+    st.markdown("---")
+    tab_add, tab_cat, tab_month, tab_log = st.tabs(["➕ Add expense", "📊 Category breakdown", "📅 Monthly savings", "🧾 Expense log"])
+
+    # ---------- add ----------
+    with tab_add:
+        a1, a2 = st.columns(2, gap="large")
+        with a1:
+            st.date_input("Date", value=TODAY, key="fin_date")
+            st.selectbox("Category", EXPENSE_CATS, format_func=lambda c: f"{CAT_ICONS[c]} {c}", key="fin_cat")
+            st.number_input("Amount (£)", min_value=0.0, step=1.0, format="%.2f", key="fin_amt")
+        with a2:
+            st.text_input("Notes (optional)", placeholder="e.g. weekly shop, monthly pass", key="fin_notes")
+            st.number_input("Repeat monthly for extra months", min_value=0, max_value=36, step=1, key="fin_repeat",
+                            help="For recurring costs (car insurance, mobile bill…): 3 adds this expense now plus the next 3 months.")
+            st.caption("Recurring entries are created on the same day each month and can be edited or deleted individually.")
+            st.button("Add expense", type="primary", on_click=add_expense)
+
+    # ---------- category breakdown ----------
+    with tab_cat:
+        rows = [{"Category": f"{CAT_ICONS[c]} {c}", "Spend": spend[c],
+                 "Share": (spend[c] / counted_total * 100 if (c in active and counted_total > 0) else 0.0),
+                 "Entries": cnt[c], "Status": "✅ Counted" if c in active else "➖ Excluded"} for c in EXPENSE_CATS]
+        table = pd.DataFrame(rows).sort_values("Spend", ascending=False)
+        st.caption(f"Total spend per category · {period_label}")
+        show_table(table, {
+            "Spend": st.column_config.NumberColumn("Total spend (£)", format="%.2f"),
+            "Share": st.column_config.ProgressColumn("Share of counted spend", format="%.0f%%", min_value=0, max_value=100),
+            "Entries": st.column_config.NumberColumn("Entries", format="%d")})
+        t1, t2 = st.columns(2)
+        with t1: card("All categories", gbp(all_total), "everything logged in this period", "slate")
+        with t2: card("Counted in scenario", gbp(counted_total), "used for the savings figure", "indigo")
+        chart = pd.Series({c: spend[c] for c in active}).sort_values(ascending=False) if active else pd.Series(dtype=float)
+        if chart.sum() > 0:
+            st.caption("Counted categories only")
+            st.bar_chart(chart, color="#6366f1")
         else:
-            m = metrics(df, capital)
-            ret = m["net"] / capital * 100 if capital else 0.0
-            c = st.columns(5)
-            with c[0]: a.card("Net P&L", a.gbp(m["net"]), f"{ret:.1f}% of capital" if capital else "", "green" if m["net"] >= 0 else "red")
-            with c[1]: a.card("Win rate", f"{m['win_rate']:.0f}%", f"{m['n']} trades", "indigo")
-            with c[2]: a.card("Profit factor", "∞" if np.isinf(m["pf"]) else f"{m['pf']:.2f}", "gross wins ÷ gross losses", "teal")
-            with c[3]: a.card("Expectancy", a.gbp(m["expectancy"]), "average per trade", "green" if m["expectancy"] >= 0 else "red")
-            with c[4]: a.card("Max drawdown", a.gbp(m["max_dd"]), f"{m['max_dd_pct']:.1f}% from peak", "red")
-            c = st.columns(5)
-            with c[0]: a.card("Avg win", a.gbp(m["avg_w"]), "", "green")
-            with c[1]: a.card("Avg loss", a.gbp(m["avg_l"]), "", "red")
-            with c[2]: a.card("Avg R", "–" if np.isnan(m["avg_r"]) else f"{m['avg_r']:.2f}R", "needs a stop price", "indigo")
-            with c[3]: a.card("Best / worst", f"{a.gbp(m['best'])} / {a.gbp(m['worst'])}", "single trades", "amber")
-            with c[4]: a.card("Longest streaks", f"{m['bw']}W / {m['bl']}L", "wins / losses in a row", "slate")
+            st.info("No counted spending in this period yet.")
 
-            st.markdown("---")
-            st.subheader("Equity curve")
-            st.caption("Account value after each trade (starting capital + cumulative P&L)")
-            st.line_chart(pd.DataFrame({"Equity": m["eq"].values}, index=range(1, len(df) + 1)), color="#6366f1")
-            d1, d2 = st.columns(2)
-            with d1:
-                st.subheader("Drawdown")
-                st.area_chart(pd.DataFrame({"Drawdown": m["dd"].values}, index=range(1, len(df) + 1)), color="#ef4444")
-            with d2:
-                st.subheader("Daily P&L")
-                day = df.groupby(df["trade_date"].dt.date)["net"].sum()
-                st.bar_chart(pd.DataFrame({"Profit": day.clip(lower=0), "Loss": day.clip(upper=0)}),
-                             color=["#10b981", "#ef4444"])
-
-    # ================= calendar =================
-    with t_cal:
-        if raw.empty:
-            st.info("No trades yet. Log your first one in the **Log trade** tab.")
-        elif df.empty:
-            st.warning("No trades match these filters.")
+    # ---------- monthly savings ----------
+    with tab_month:
+        e_m = monthly_earnings(shifts, use_net, only_paid)
+        x_m = pd.Series(dtype=float)
+        if not expenses.empty:
+            ex = expenses[expenses["category"].isin(active)]
+            if not ex.empty:
+                x_m = ex.groupby(ex["expense_date"].dt.to_period("M"))["amount"].sum()
+        months = sorted(set(e_m.index) | set(x_m.index))
+        if not months:
+            st.info("Add shifts and expenses to see your month-by-month savings.")
         else:
-            render_calendar(a, df, counts)
+            mdf = pd.DataFrame({"Month": months})
+            mdf["Earnings"] = [float(e_m.get(m, 0.0)) for m in months]
+            mdf["Expenses"] = [float(x_m.get(m, 0.0)) for m in months]
+            mdf["Saved"] = mdf["Earnings"] - mdf["Expenses"]
+            mdf["Result"] = mdf["Saved"].apply(lambda v: "🟢 Saved" if v >= 0 else "🔴 Overspent")
+            st.caption("Total money saved each month (uses the categories ticked above)")
+            ch = mdf.tail(12).copy()
+            ch.index = [m.strftime("%Y-%m") for m in ch["Month"]]
+            st.bar_chart(pd.DataFrame({"Saved": ch["Saved"].clip(lower=0), "Overspent": ch["Saved"].clip(upper=0)}),
+                         color=["#10b981", "#ef4444"])
+            out = mdf.sort_values("Month", ascending=False).copy()
+            out["Month"] = out["Month"].dt.strftime("%b %Y")
+            nm = lambda t: st.column_config.NumberColumn(t, format="%.2f")
+            show_table(out[["Month", "Earnings", "Expenses", "Saved", "Result"]],
+                       {"Earnings": nm("Earnings (£)"), "Expenses": nm("Expenses (£)"), "Saved": nm("Saved (£)")})
 
-    # ================= history with screenshots =================
-    with t_hist:
-        if raw.empty:
-            st.info("No trades yet. Log your first one in the **Log trade** tab.")
-        elif df.empty:
-            st.warning("No trades match these filters.")
+    # ---------- expense log (editable) ----------
+    with tab_log:
+        if exp_p.empty:
+            st.info("No expenses logged for this period yet. Add one in the first tab.")
         else:
-            render_history(a, df, counts)
-
-    # ================= log a trade =================
-    with t_log:
-        defaults = {"tj_side": "Long", "tj_qty": 100.0, "tj_mult": 1.0, "tj_fees": 0.0, "tj_entry": 0.0,
-                    "tj_exit": 0.0, "tj_stop": 0.0, "tj_symbol": "", "tj_setup": "", "tj_tags": "",
-                    "tj_notes": "", "tj_mood": MOODS[0], "tj_rating": 3}
-        for k, v in defaults.items():
-            ss.setdefault(k, v)
-
-        def save_trade():
-            sym = (ss.tj_symbol or "").strip().upper()
-            if not sym or ss.tj_entry <= 0 or ss.tj_exit <= 0 or ss.tj_qty <= 0:
-                ss.flash = ("error", "Symbol, entry price, exit price and quantity are required.")
-                return
-            pnl = calc_net(ss.tj_side, ss.tj_entry, ss.tj_exit, ss.tj_qty, ss.tj_mult, ss.tj_fees)
-            new = a.query_df(f"INSERT INTO trading_journal (user_id, {', '.join(FIELDS)}) VALUES (%s, {', '.join(['%s'] * len(FIELDS))}) RETURNING id",
-                  (a.uid(), ss.tj_date, sym, ss.tj_side, float(ss.tj_entry), float(ss.tj_exit), float(ss.tj_qty),
-                   float(ss.tj_stop), float(ss.tj_fees), float(ss.tj_mult), (ss.tj_setup or "").strip(),
-                   ss.tj_mood, int(ss.tj_rating), (ss.tj_tags or "").strip(), (ss.tj_notes or "").strip()))
-            saved, problems = save_shots(a, int(new["id"].iloc[0]), ss.get(f"tj_shots_{ss.tj_up_ver}"))
-            ss.tj_up_ver += 1
-            for k in ("tj_symbol", "tj_setup", "tj_tags", "tj_notes"):
-                ss[k] = ""
-            for k in ("tj_entry", "tj_exit", "tj_stop", "tj_fees"):
-                ss[k] = 0.0
-            shots_txt = f" with {saved} screenshot(s)" if saved else ""
-            ss.flash = ("warning" if problems else "success",
-                        f"Trade saved{shots_txt}: {sym} {ss.tj_side.lower()}, P&L {a.gbp(pnl)}." + (" " + " ".join(problems) if problems else ""))
-
-        l1, l2 = st.columns(2, gap="large")
-        with l1:
-            st.subheader("🗓️ The trade")
-            st.date_input("Date", value=a.today, key="tj_date")
-            st.text_input("Symbol", placeholder="e.g. AAPL, EURUSD, ES", key="tj_symbol")
-            x1, x2 = st.columns(2)
-            x1.selectbox("Side", ["Long", "Short"], key="tj_side")
-            x2.number_input("Quantity", min_value=0.0, step=1.0, format="%.2f", key="tj_qty")
-            p1, p2, p3 = st.columns(3)
-            p1.number_input("Entry price", min_value=0.0, format="%.4f", key="tj_entry")
-            p2.number_input("Exit price", min_value=0.0, format="%.4f", key="tj_exit")
-            p3.number_input("Stop loss (0 = none)", min_value=0.0, format="%.4f", key="tj_stop",
-                            help="Used to work out your R-multiple (profit as a multiple of what you risked).")
-            q1, q2 = st.columns(2)
-            q1.number_input("Fees (£)", min_value=0.0, step=0.5, format="%.2f", key="tj_fees")
-            q2.number_input("Contract multiplier", min_value=0.0, step=1.0, key="tj_mult",
-                            help="1 for shares and spot FX, 50 for ES futures, 100 for options.")
-        with l2:
-            st.subheader("🧠 Context")
-            st.text_input("Setup", placeholder="Breakout, pullback, gap fill…", key="tj_setup")
-            y1, y2 = st.columns(2)
-            y1.selectbox("Mood", MOODS, key="tj_mood")
-            y2.slider("Execution quality", 1, 5, key="tj_rating", help="How well did you follow your plan, win or lose?")
-            st.text_input("Tags (comma separated)", placeholder="earnings, news, london-open", key="tj_tags")
-            st.text_area("Notes: what happened, what would you change?", height=120, key="tj_notes")
-            st.file_uploader(f"Screenshots (optional, up to {MAX_SHOTS})", type=IMG_TYPES, accept_multiple_files=True,
-                             key=f"tj_shots_{ss.tj_up_ver}", help="Chart before entry, the exit, your platform's trade summary…")
-
-        pnl = calc_net(ss.tj_side, ss.tj_entry, ss.tj_exit, ss.tj_qty, ss.tj_mult, ss.tj_fees)
-        risk = abs(ss.tj_entry - ss.tj_stop) * ss.tj_qty * ss.tj_mult if ss.tj_stop > 0 else 0.0
-        st.markdown("---")
-        st.subheader("🔎 Live preview")
-        pv = st.columns(4)
-        with pv[0]: a.card("Net P&L", a.gbp(pnl), "after fees", "green" if pnl >= 0 else "red")
-        with pv[1]: a.card("R multiple", f"{pnl / risk:.2f}R" if risk > 0 else "–", "needs a stop price", "indigo")
-        with pv[2]: a.card("Risk at stop", a.gbp(risk) if risk > 0 else "–", "", "amber")
-        with pv[3]: a.card("Fees", a.gbp(ss.tj_fees), "", "slate")
-        st.button("💾 Save trade", type="primary", on_click=save_trade)
-
-    # ================= trades table (edit / delete) =================
-    with t_trades:
-        if raw.empty:
-            st.info("Nothing logged yet.")
-        else:
-            view = enrich(raw).sort_values(["trade_date", "id"], ascending=[False, False]).copy()
-            view["trade_date"] = view["trade_date"].dt.date
+            view = exp_p.sort_values(["expense_date", "id"], ascending=[False, False]).copy()
+            view["expense_date"] = view["expense_date"].dt.date
+            view["notes"] = view["notes"].fillna("").astype(str)
+            view["amount"] = view["amount"].astype(float)
+            view["counted"] = view["category"].isin(active).map({True: "✅", False: "➖"})
             view.insert(0, "Delete", False)
-            view["shots"] = view["id"].map(counts).fillna(0).astype(int)
-            view = view[["Delete", "id"] + FIELDS + ["net", "shots"]]
-            extra = sorted(set(view["mood"]) - set(MOODS) - {""})
-            st.caption("Edit any cell, tick **Delete** to remove rows, then press **Save changes**. "
-                       "This table always shows all of your trades, regardless of the filters.")
+            view = view[["Delete", "id", "expense_date", "category", "amount", "notes", "counted"]]
+            st.caption("Edit any cell directly, tick **Delete** to remove rows, then press **Save changes**.")
             edited = st.data_editor(
-                view, hide_index=True, key=f"tj_editor_{ss.tj_ver}", disabled=["id", "net", "shots"],
+                view, hide_index=True, key=f"fin_editor_{ss.fin_ver}", disabled=["id", "counted"],
                 column_config={
                     "Delete": st.column_config.CheckboxColumn("Delete"), "id": None,
-                    "trade_date": st.column_config.DateColumn("Date", format="DD MMM YYYY", required=True),
-                    "symbol": st.column_config.TextColumn("Symbol", required=True),
-                    "side": st.column_config.SelectboxColumn("Side", options=["Long", "Short"], required=True),
-                    "entry_price": st.column_config.NumberColumn("Entry", format="%.4f", min_value=0.0),
-                    "exit_price": st.column_config.NumberColumn("Exit", format="%.4f", min_value=0.0),
-                    "qty": st.column_config.NumberColumn("Qty", min_value=0.0),
-                    "stop_price": st.column_config.NumberColumn("Stop", format="%.4f", min_value=0.0),
-                    "fees": st.column_config.NumberColumn("Fees (£)", format="%.2f", min_value=0.0),
-                    "multiplier": st.column_config.NumberColumn("Mult.", min_value=0.0),
-                    "mood": st.column_config.SelectboxColumn("Mood", options=MOODS + extra),
-                    "rating": st.column_config.NumberColumn("Quality", min_value=1, max_value=5, step=1),
-                    "net": st.column_config.NumberColumn("Net P&L (£)", format="%.2f"),
-                    "shots": st.column_config.NumberColumn("📷", format="%d")})
-            if st.button("💾 Save changes", type="primary", key="tj_save_edits"):
+                    "expense_date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
+                    "category": st.column_config.SelectboxColumn("Category", options=EXPENSE_CATS, required=True),
+                    "amount": st.column_config.NumberColumn("Amount (£)", min_value=0.01, format="%.2f", required=True),
+                    "notes": st.column_config.TextColumn("Notes"), "counted": "Counted"})
+            if st.button("💾 Save changes", type="primary", key="fin_save"):
                 orig = view.set_index("id")
                 n_upd = n_del = n_bad = 0
                 for _, r in edited.iterrows():
                     rid = int(r["id"])
                     if r["Delete"]:
-                        a.run("DELETE FROM trading_journal_shots WHERE trade_id = %s AND user_id = %s", (rid, a.uid()))
-                        a.run("DELETE FROM trading_journal WHERE id = %s AND user_id = %s", (rid, a.uid()))
+                        run("DELETE FROM personal_expenses WHERE id = %s AND user_id = %s", (rid, uid()))
                         n_del += 1
                         continue
-                    sym = str(r["symbol"] or "").strip().upper()
-                    nums_ok = all(pd.notna(r[c]) for c in NUM) and r["entry_price"] > 0 and r["exit_price"] > 0 and r["qty"] > 0
-                    if pd.isna(r["trade_date"]) or not sym or r["side"] not in ("Long", "Short") or not nums_ok:
+                    o = orig.loc[rid]
+                    new_date = pd.to_datetime(r["expense_date"]).date() if pd.notna(r["expense_date"]) else None
+                    amt = r["amount"]
+                    if new_date is None or pd.isna(amt) or float(amt) <= 0 or r["category"] not in EXPENSE_CATS:
                         n_bad += 1
                         continue
-                    new = [pd.to_datetime(r["trade_date"]).date(), sym, r["side"]] + [float(r[c]) for c in NUM] + [
-                        str(r["setup"] or "").strip(), str(r["mood"] or ""), int(r["rating"]) if pd.notna(r["rating"]) else 3,
-                        str(r["tags"] or "").strip(), str(r["notes"] or "").strip()]
-                    # NUM columns sit in a different order than FIELDS, so rebuild in FIELDS order
-                    vals = dict(zip(["trade_date", "symbol", "side"] + NUM + ["setup", "mood", "rating", "tags", "notes"], new))
-                    o = orig.loc[rid]
-                    changed = any((str(vals[f]) != str(o[f])) if f in ("trade_date", "symbol", "side", "setup", "mood", "tags", "notes")
-                                  else round(float(vals[f]), 6) != round(float(o[f]), 6) for f in FIELDS)
-                    if changed:
-                        a.run(f"UPDATE trading_journal SET {', '.join(f'{f} = %s' for f in FIELDS)} WHERE id = %s AND user_id = %s",
-                              [vals[f] for f in FIELDS] + [rid, a.uid()])
+                    note = r["notes"] if isinstance(r["notes"], str) else ""
+                    if (new_date != o["expense_date"] or r["category"] != o["category"]
+                            or round(float(amt), 2) != round(float(o["amount"]), 2) or note != o["notes"]):
+                        run("UPDATE personal_expenses SET expense_date=%s, category=%s, amount=%s, notes=%s WHERE id=%s AND user_id=%s",
+                            (new_date, r["category"], round(float(amt), 2), note.strip(), rid, uid()))
                         n_upd += 1
-                ss.tj_ver += 1
+                ss.fin_ver += 1
                 msg = f"Saved: {n_upd} updated, {n_del} deleted."
-                ss.flash = ("warning", msg + f" {n_bad} row(s) skipped (check date, symbol, side, prices and quantity).") if n_bad else ("success", msg)
+                ss.flash = ("warning", msg + f" {n_bad} row(s) skipped (needs a date, category and amount above £0).") if n_bad else ("success", msg)
                 st.rerun()
 
-    # ================= analytics =================
-    with t_an:
-        if df.empty:
-            st.info("Log some trades (and check your filters) to see analytics.")
+# ==========================================================
+# PAGE: TRADING JOURNAL  (logic lives in trading_journal.py)
+# ==========================================================
+elif page == PAGES[8]:
+    render_trading_journal(SimpleNamespace(
+        uid=uid, run=run, query_df=query_df, hero=hero, card=card, show_table=show_table,
+        gbp=gbp, show_flash=show_flash, today=TODAY, settings=settings,
+        save_setting=save_setting, to_excel_bytes=to_excel_bytes))
+
+# ==========================================================
+# PAGE: SETTINGS & BACKUP
+# ==========================================================
+elif page == PAGES[9]:
+    hero("🛠️ Settings & Backup", "Your account, security, backups and CSV import.")
+    show_flash()
+    _names = ["🔐 Security", "💾 Backup & restore", "📥 Import CSV", "🏢 Employers"] + (["👥 Users"] if is_admin() else [])
+    _tabs = st.tabs(_names)
+    t_sec, t_bak, t_imp, t_emp = _tabs[0], _tabs[1], _tabs[2], _tabs[3]
+    t_users = _tabs[4] if is_admin() else None
+
+    def my_hash():
+        return str(query_df("SELECT password_hash FROM users WHERE id = %s", (uid(),))["password_hash"].iloc[0])
+
+    def change_password():
+        cur_pw, new_pw, conf = ss.get("pw_cur", ""), ss.get("pw_new", ""), ss.get("pw_conf", "")
+        if not verify_hash(cur_pw, my_hash()):
+            ss.flash = ("error", "Your current password is wrong.")
+        elif len(new_pw) < 8:
+            ss.flash = ("error", "The new password needs at least 8 characters.")
+        elif new_pw != conf:
+            ss.flash = ("error", "The two new passwords don't match.")
         else:
-            by = st.selectbox("Break down by", ["setup", "mood", "symbol", "weekday", "side", "rating", "tags"], key="tj_by")
-            src = df.copy()
-            if by == "tags":
-                src["tags"] = src["tags"].str.split(",")
-                src = src.explode("tags")
-                src["tags"] = src["tags"].str.strip().replace("", "(none)")
-            elif by in ("setup", "mood"):
-                src[by] = src[by].replace("", "(none)")
-            tbl = breakdown(src, by)
-            a.show_table(tbl, {"Net P&L": st.column_config.NumberColumn("Net P&L (£)", format="%.2f"),
-                               "Avg P&L": st.column_config.NumberColumn("Avg P&L (£)", format="%.2f"),
-                               "Win rate %": st.column_config.NumberColumn("Win rate %", format="%.1f"),
-                               "Avg R": st.column_config.NumberColumn("Avg R", format="%.2f")})
-            st.caption("Net P&L per group. Look for the moods and setups that cost you money.")
-            st.bar_chart(tbl.set_index("Group")["Net P&L"].astype(float), color="#6366f1")
+            run("UPDATE users SET password_hash = %s WHERE id = %s", (make_password_hash(new_pw), uid()))
+            ss.pw_cur = ss.pw_new = ss.pw_conf = ""
+            ss.flash = ("success", "Password changed.")
 
-            r = df["r"].dropna()
-            if len(r) >= 2:
-                st.subheader("R-multiple distribution")
-                counts, edges = np.histogram(r, bins=min(12, max(4, len(r) // 3)))
-                labels = [f"{edges[i]:.1f} to {edges[i + 1]:.1f}" for i in range(len(counts))]
-                st.bar_chart(pd.Series(counts, index=labels, name="Trades"), color="#14b8a6")
-            else:
-                st.caption("Add stop prices to trades to unlock R-multiple analysis.")
+    def enable_2fa():
+        secret = ss.get("totp_new")
+        if not secret or not verify_totp(secret, ss.get("totp_test", "")):
+            ss.flash = ("error", "That code doesn't match, so 2FA was not turned on.")
+            return
+        run("UPDATE users SET totp_secret = %s WHERE id = %s", (secret, uid()))
+        ss.pop("totp_new", None)
+        ss.totp_test = ""
+        ss.flash = ("success", "Two-factor login is now ON.")
 
-            st.subheader("P&L by month")
-            mon = df.groupby(df["trade_date"].dt.to_period("M"))["net"].sum()
-            mon.index = mon.index.strftime("%Y-%m")
-            st.bar_chart(pd.DataFrame({"Profit": mon.clip(lower=0), "Loss": mon.clip(upper=0)}), color=["#10b981", "#ef4444"])
+    def disable_2fa():
+        if not verify_hash(ss.get("tfa_off_pw", ""), my_hash()):
+            ss.flash = ("error", "Wrong password, so 2FA was left on.")
+            return
+        run("UPDATE users SET totp_secret = NULL WHERE id = %s", (uid(),))
+        ss.tfa_off_pw = ""
+        ss.flash = ("success", "Two-factor login is now OFF.")
 
-    # ================= import / export =================
-    with t_io:
-        c1, c2 = st.columns(2, gap="large")
-        with c1:
-            st.markdown("#### Export")
-            if raw.empty:
-                st.caption("Nothing to export yet.")
-            else:
-                out = enrich(raw).drop(columns=["weekday"])
-                out["trade_date"] = out["trade_date"].dt.date
-                st.download_button("📄 Download CSV", out.to_csv(index=False).encode(), f"trading_journal_{a.today:%Y%m%d}.csv", "text/csv")
-                xl = a.to_excel_bytes({"Trades": out})
-                if xl:
-                    st.download_button("📗 Download Excel", xl, f"trading_journal_{a.today:%Y%m%d}.xlsx",
-                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with c2:
-            st.markdown("#### Import from CSV (adds to existing trades)")
-            st.caption("Required: `trade_date`, `symbol`, `side` (Long/Short or Buy/Sell), `entry_price`, `exit_price`, `qty`. "
-                       "Optional: `stop_price`, `fees`, `multiplier`, `setup`, `mood`, `rating`, `tags`, `notes`. Dates are read day-first.")
-            sample = pd.DataFrame([{"trade_date": "31/10/2026", "symbol": "AAPL", "side": "Long", "entry_price": 180.5,
-                                    "exit_price": 184.2, "qty": 50, "stop_price": 178.0, "fees": 1.0, "setup": "Breakout",
-                                    "mood": "Calm", "rating": 4, "tags": "earnings", "notes": ""}])
-            st.download_button("Download sample CSV", sample.to_csv(index=False).encode(), "trades_sample.csv", "text/csv")
-            up = st.file_uploader("Trades CSV", type="csv", key="tj_import")
-            if up:
+    with t_sec:
+        me = query_df("SELECT totp_secret FROM users WHERE id = %s", (uid(),)).iloc[0]
+        tfa_on = isinstance(me["totp_secret"], str) and bool(me["totp_secret"])
+        s1, s2 = st.columns(2)
+        with s1: card("Signed in as", html.escape(ss.user["username"]), f"role: {ss.user['role']}", "indigo")
+        with s2: card("Two-factor login", "On" if tfa_on else "Off", "authenticator app", "green" if tfa_on else "amber")
+        st.caption(f"Lockout: {MAX_FAILS} failed logins for a username blocks sign-in for that username for 15 minutes.")
+
+        st.markdown("#### Change password")
+        st.text_input("Current password", type="password", key="pw_cur")
+        st.text_input("New password (at least 8 characters)", type="password", key="pw_new")
+        st.text_input("Repeat new password", type="password", key="pw_conf")
+        st.button("Change password", type="primary", on_click=change_password)
+
+        st.markdown("#### Two-factor authentication (authenticator app)")
+        if tfa_on:
+            st.success("2FA is on for your account. You'll be asked for a 6-digit code when you sign in.")
+            st.text_input("Enter your password to turn it off", type="password", key="tfa_off_pw")
+            st.button("Turn 2FA off", on_click=disable_2fa)
+        else:
+            if st.button("Set up 2FA"):
+                ss.totp_new = base64.b32encode(os.urandom(20)).decode()
+            if ss.get("totp_new"):
+                uri = f"otpauth://totp/RotaTracker:{ss.user['username']}?secret={ss.totp_new}&issuer=RotaTracker"
+                st.caption("Add this key in Google Authenticator / Microsoft Authenticator / Authy (time-based):")
+                st.code(ss.totp_new)
                 try:
-                    imp = pd.read_csv(up)
-                    imp.columns = [c.strip().lower() for c in imp.columns]
-                    need = ["trade_date", "symbol", "side", "entry_price", "exit_price", "qty"]
-                    missing = [c for c in need if c not in imp.columns]
-                    if missing:
-                        st.error(f"Missing column(s): {', '.join(missing)}")
-                    else:
-                        imp["_date"] = pd.to_datetime(imp["trade_date"], dayfirst=True, errors="coerce")
-                        imp["side"] = imp["side"].astype(str).str.strip().str.lower().map(
-                            {"long": "Long", "buy": "Long", "short": "Short", "sell": "Short"})
-                        for c in ["entry_price", "exit_price", "qty"]:
-                            imp[c] = pd.to_numeric(imp[c], errors="coerce")
-                        ok = imp["_date"].notna() & imp["side"].notna() & imp["symbol"].notna() & \
-                            (imp["entry_price"] > 0) & (imp["exit_price"] > 0) & (imp["qty"] > 0)
-                        good = imp[ok]
-                        st.write(f"**{len(good)}** valid row(s), **{int((~ok).sum())}** skipped.")
-                        a.show_table(good.drop(columns=["_date"]).head(20))
-                        if len(good) and st.button(f"Import {len(good)} trade(s)", type="primary", key="tj_do_import"):
-                            def num(r, c, d=0.0):
-                                return float(r[c]) if c in imp.columns and pd.notna(r[c]) else d
-                            def txt(r, c, d=""):
-                                return str(r[c]).strip() if c in imp.columns and pd.notna(r[c]) else d
-                            for _, r in good.iterrows():
-                                a.run(f"INSERT INTO trading_journal (user_id, {', '.join(FIELDS)}) VALUES (%s, {', '.join(['%s'] * len(FIELDS))})",
-                                      (a.uid(), r["_date"].date(), str(r["symbol"]).strip().upper(), r["side"],
-                                       float(r["entry_price"]), float(r["exit_price"]), float(r["qty"]),
-                                       num(r, "stop_price"), num(r, "fees"), num(r, "multiplier", 1.0) or 1.0,
-                                       txt(r, "setup"), txt(r, "mood", MOODS[0]) or MOODS[0],
-                                       int(num(r, "rating", 3)) or 3, txt(r, "tags"), txt(r, "notes")))
-                            ss.flash = ("success", f"Imported {len(good)} trade(s).")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Could not read the CSV: {e}")
+                    import qrcode
+                    img = qrcode.make(uri)
+                    qbuf = io.BytesIO(); img.save(qbuf, format="PNG")
+                    st.image(qbuf.getvalue(), width=200)
+                except Exception:
+                    pass
+                st.text_input("Type the 6-digit code from your app to confirm", key="totp_test")
+                st.button("Turn 2FA on", type="primary", on_click=enable_2fa)
 
-        if not raw.empty:
-            def wipe():
-                if ss.get("tj_wipe_ok"):
-                    a.run("DELETE FROM trading_journal_shots WHERE user_id = %s", (a.uid(),))
-                    a.run("DELETE FROM trading_journal WHERE user_id = %s", (a.uid(),))
-                    ss.tj_wipe_ok = False
-                    ss.flash = ("success", "All journal trades deleted.")
+    with t_bak:
+        BACKUP_COLS = {
+            "shifts": ["shift_date", "employer", "start_time", "end_time", "hourly_rate", "hours_worked", "hourly_earning",
+                       "mileage_earning", "tips", "fuel_cost", "expense_cost", "gross_earning", "paid", "miles"],
+            "gogo_transactions": ["trans_date", "trans_type", "amount", "notes"],
+            "employers": ["name", "default_rate", "pay_mode", "active"],
+            "shift_templates": ["name", "employer", "start_time", "end_time", "hourly_rate"],
+            "personal_expenses": ["expense_date", "category", "amount", "notes"],
+            "trading_journal": TJ_BACKUP,
+        }
+        prefix = f"{uid()}:"
+        st.markdown("#### Download my backup")
+        st.caption("Contains only your own data.")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for tname, cols in BACKUP_COLS.items():
+                zf.writestr(f"{tname}.csv", query_df(f"SELECT {', '.join(cols)} FROM {tname} WHERE user_id = %s ORDER BY id", (uid(),)).to_csv(index=False))
+            sett = query_df("SELECT key, value FROM app_settings WHERE key LIKE %s", (prefix + "%",))
+            sett["key"] = sett["key"].astype(str).str[len(prefix):]
+            zf.writestr("app_settings.csv", sett.to_csv(index=False))
+        st.download_button("⬇️ Download backup (.zip)", buf.getvalue(), f"rota_backup_{ss.user['username']}_{TODAY:%Y%m%d}.zip", "application/zip", type="primary")
+
+        st.markdown("#### Restore from a backup")
+        st.warning("Restoring **replaces all of your current data** with the backup. It never touches other users' data. Download a fresh backup first.")
+        up = st.file_uploader("Backup .zip", type="zip", key="restore_zip")
+        ok = st.checkbox("I understand this will overwrite my current data", key="restore_ok")
+        if st.button("Restore now", disabled=not (up and ok)):
+            conn = get_conn()
+            conn.autocommit = False
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+                names = zf.namelist()
+                with conn.cursor() as cur:
+                    for tname, allowed in BACKUP_COLS.items():
+                        if f"{tname}.csv" not in names:
+                            continue
+                        df = pd.read_csv(zf.open(f"{tname}.csv"))
+                        use = [c for c in allowed if c in df.columns]
+                        cur.execute(f"DELETE FROM {tname} WHERE user_id = %s", (uid(),))
+                        rows = [(uid(),) + tuple(None if pd.isna(v) else (v.item() if hasattr(v, "item") else v) for v in row)
+                                for row in df[use].itertuples(index=False)]
+                        if rows:
+                            cur.executemany(f"INSERT INTO {tname} (user_id, {', '.join(use)}) VALUES (%s, {', '.join(['%s'] * len(use))})", rows)
+                    if "app_settings.csv" in names:
+                        sdf = pd.read_csv(zf.open("app_settings.csv"), dtype=str).fillna("")
+                        cur.execute("DELETE FROM app_settings WHERE key LIKE %s", (prefix + "%",))
+                        for k, v in zip(sdf["key"], sdf["value"]):
+                            cur.execute("INSERT INTO app_settings (key, value) VALUES (%s, %s)", (prefix + k, v))
+                conn.commit()
+                ss.flash = ("success", "Backup restored successfully.")
+            except Exception as e:
+                conn.rollback()
+                ss.flash = ("error", f"Restore failed, nothing was changed: {e}")
+            finally:
+                conn.autocommit = True
+            st.rerun()
+
+    with t_imp:
+        st.markdown("#### Import shifts from CSV (adds to existing data)")
+        st.caption("Required columns: `shift_date`, `employer`, `start_time`, `end_time`. "
+                   "Optional: `hourly_rate`, `mileage_earning`, `tips`, `fuel_cost`, `expense_cost`, `total_paid` (for total-paid employers), `miles`, `paid`. "
+                   "Dates like 31/10/2026 are read day-first.")
+        sample = pd.DataFrame([{"shift_date": "31/10/2026", "employer": (ALL_EMPLOYERS[0] if ALL_EMPLOYERS else "EMPLOYER"), "start_time": "09:00", "end_time": "17:00",
+                                "hourly_rate": 14.0, "mileage_earning": 0, "tips": 5, "fuel_cost": 0, "expense_cost": 0, "miles": 0, "paid": False}])
+        st.download_button("Download sample CSV", sample.to_csv(index=False).encode(), "shifts_sample.csv", "text/csv")
+        up = st.file_uploader("Shifts CSV", type="csv", key="import_csv")
+        if up:
+            try:
+                imp = pd.read_csv(up)
+                imp.columns = [c.strip().lower() for c in imp.columns]
+                missing = [c for c in ["shift_date", "employer", "start_time", "end_time"] if c not in imp.columns]
+                if missing:
+                    st.error(f"Missing column(s): {', '.join(missing)}")
                 else:
-                    ss.flash = ("error", "Tick the confirmation box first.")
-            with st.expander("⚠️ Delete all my journal trades"):
-                st.checkbox("Yes, delete every trade in my journal permanently", key="tj_wipe_ok")
-                st.button("Delete all trades", on_click=wipe)
+                    imp["_date"] = pd.to_datetime(imp["shift_date"], dayfirst=True, errors="coerce")
+                    imp["employer"] = imp["employer"].astype(str).str.strip().str.upper()
+                    bad = imp[imp["_date"].isna() | ~imp["employer"].isin(ALL_EMPLOYERS)]
+                    good = imp.drop(bad.index)
+                    st.write(f"**{len(good)}** valid row(s), **{len(bad)}** skipped (bad date or unknown employer).")
+                    show_table(good.drop(columns=["_date"]).head(20))
+                    if len(good) and st.button(f"Import {len(good)} shift(s)", type="primary"):
+                        num = lambda r, c: float(r[c]) if c in imp.columns and pd.notna(r[c]) else 0.0
+                        n = 0
+                        for _, r in good.iterrows():
+                            st_t, en_t = parse_hhmm(r["start_time"]), parse_hhmm(r["end_time"])
+                            hrs = calculate_hours(st_t, en_t)
+                            rate = num(r, "hourly_rate") or rate_for(r["employer"])
+                            hE, mE, gE, _w = compute_shift(r["employer"], hrs, rate, num(r, "total_paid"), num(r, "mileage_earning"), num(r, "tips"))
+                            pd_flag = bool(r["paid"]) if "paid" in imp.columns and pd.notna(r["paid"]) else True
+                            insert_shift(r["_date"].date(), r["employer"], st_t.strftime("%H:%M"), en_t.strftime("%H:%M"),
+                                         rate, hrs, hE, mE, num(r, "tips"), num(r, "fuel_cost"), num(r, "expense_cost"), gE, num(r, "miles"), pd_flag)
+                            n += 1
+                        ss.flash = ("success", f"Imported {n} shift(s).")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read the CSV: {e}")
+
+    def toggle_employer_active(eid):
+        row = query_df("SELECT name, active FROM employers WHERE id = %s AND user_id = %s", (eid, uid()))
+        if row.empty:
+            return
+        now_active = not bool(row.iloc[0]["active"])
+        run("UPDATE employers SET active = %s WHERE id = %s AND user_id = %s", (now_active, eid, uid()))
+        ss.flash = ("success", f"“{row.iloc[0]['name']}” {'restored' if now_active else 'archived (hidden from new shifts, history kept)'}.")
+
+    def delete_employer(eid):
+        row = query_df("SELECT name FROM employers WHERE id = %s AND user_id = %s", (eid, uid()))
+        if row.empty:
+            return
+        nm = str(row.iloc[0]["name"])
+        n = int(query_df("SELECT COUNT(*) AS n FROM shifts WHERE user_id = %s AND employer = %s", (uid(), nm))["n"].iloc[0])
+        if n > 0:
+            ss.flash = ("error", f"“{nm}” has {n} shift(s). Archive it instead so your history stays intact.")
+        elif not ss.get("emp_del_ok"):
+            ss.flash = ("error", "Tick the confirmation box first.")
+        else:
+            run("DELETE FROM employers WHERE id = %s AND user_id = %s", (eid, uid()))
+            run("DELETE FROM shift_templates WHERE user_id = %s AND employer = %s", (uid(), nm))
+            run("DELETE FROM app_settings WHERE key = %s", (f"{uid()}:wa_{nm}",))
+            ss.emp_del_ok = False
+            ss.flash = ("success", f"“{nm}” deleted.")
+
+    with t_emp:
+        edf = load_employers()
+        cnt_df = query_df("SELECT employer, COUNT(*) AS n FROM shifts WHERE user_id = %s GROUP BY employer", (uid(),))
+        cmap = dict(zip(cnt_df["employer"], cnt_df["n"]))
+        if edf.empty:
+            st.info("You haven't added any employers yet.")
+        else:
+            overview = pd.DataFrame({
+                "Employer": edf["name"], "Rate": edf["default_rate"],
+                "Pay type": edf["pay_mode"].map({"hourly": "Hourly + extras", "total_paid": "Total paid"}),
+                "Status": edf["active"].map({True: "🟢 Active", False: "📦 Archived"}),
+                "Shifts": [int(cmap.get(n, 0)) for n in edf["name"]]})
+            show_table(overview, {"Rate": st.column_config.NumberColumn("Default rate (£/hr)", format="%.2f")})
+
+        st.markdown("#### Add a new employer")
+        render_add_employer("settings")
+
+        if not edf.empty:
+            st.markdown("#### Edit an employer")
+            elabels = {int(r.id): f"{r.name}{'' if r.active else ' (archived)'}" for r in edf.itertuples()}
+            esel2 = st.selectbox("Employer", list(elabels), format_func=elabels.get, key="emp_edit_sel")
+            erow = edf[edf["id"] == esel2].iloc[0]
+            ek = f"emp{esel2}_{erow['default_rate']}_{erow['pay_mode']}_"
+            with st.form("edit_employer_form"):
+                new_rate = st.number_input("Default hourly rate (£)", min_value=0.0, value=float(erow["default_rate"]),
+                                           step=0.10, format="%.2f", key=ek + "rate")
+                modes = list(PAY_MODES)
+                new_mode = st.radio("How does this employer pay you?", modes, index=modes.index(erow["pay_mode"]) if erow["pay_mode"] in modes else 0,
+                                    format_func=PAY_MODES.get, key=ek + "mode")
+                if st.form_submit_button("Save changes", type="primary"):
+                    run("UPDATE employers SET default_rate = %s, pay_mode = %s WHERE id = %s AND user_id = %s",
+                        (round(new_rate, 2), new_mode, int(esel2), uid()))
+                    ss.flash = ("success", "Employer updated. Past shifts keep the values they were saved with.")
+                    st.rerun()
+            b1, b2 = st.columns(2)
+            b1.button("Restore employer" if not erow["active"] else "Archive employer", on_click=toggle_employer_active, args=(int(esel2),))
+            with st.expander("⚠️ Delete this employer"):
+                st.caption("Only possible when the employer has no shifts. Otherwise archive it.")
+                st.checkbox("Yes, delete this employer", key="emp_del_ok")
+                st.button("Delete employer", on_click=delete_employer, args=(int(esel2),))
+
+    if t_users is not None and is_admin():
+        USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,30}$")
+
+        def count_active_admins():
+            return int(query_df("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = TRUE")["n"].iloc[0])
+
+        def admin_reset_pw():
+            if not is_admin():
+                return
+            pw = ss.get("mng_pw", "")
+            if len(pw) < 8:
+                ss.flash = ("error", "The temporary password needs at least 8 characters.")
+                return
+            run("UPDATE users SET password_hash = %s WHERE id = %s", (make_password_hash(pw), int(ss.mng_user)))
+            ss.mng_pw = ""
+            ss.flash = ("success", "Password reset. Tell the user to change it after signing in.")
+
+        def admin_toggle_active():
+            if not is_admin():
+                return
+            tid = int(ss.mng_user)
+            row = query_df("SELECT role, active FROM users WHERE id = %s", (tid,))
+            if row.empty:
+                return
+            if tid == uid():
+                ss.flash = ("error", "You can't disable your own account.")
+            elif bool(row.iloc[0]["active"]) and row.iloc[0]["role"] == "admin" and count_active_admins() <= 1:
+                ss.flash = ("error", "You can't disable the last active admin.")
+            else:
+                run("UPDATE users SET active = %s WHERE id = %s", (not bool(row.iloc[0]["active"]), tid))
+                ss.flash = ("success", "Account updated.")
+
+        def admin_set_role():
+            if not is_admin():
+                return
+            tid = int(ss.mng_user)
+            row = query_df("SELECT role, active FROM users WHERE id = %s", (tid,))
+            if row.empty:
+                return
+            new_role = "user" if row.iloc[0]["role"] == "admin" else "admin"
+            if tid == uid():
+                ss.flash = ("error", "You can't change your own role.")
+            elif new_role == "user" and bool(row.iloc[0]["active"]) and count_active_admins() <= 1:
+                ss.flash = ("error", "There must be at least one active admin.")
+            else:
+                run("UPDATE users SET role = %s WHERE id = %s", (new_role, tid))
+                ss.flash = ("success", f"Role changed to {new_role}.")
+
+        def admin_remove_2fa():
+            if is_admin():
+                run("UPDATE users SET totp_secret = NULL WHERE id = %s", (int(ss.mng_user),))
+                ss.flash = ("success", "2FA removed for that user (they can set it up again).")
+
+        def admin_delete_user():
+            if not is_admin():
+                return
+            tid = int(ss.mng_user)
+            row = query_df("SELECT username, role, active FROM users WHERE id = %s", (tid,))
+            if row.empty:
+                return
+            name = str(row.iloc[0]["username"])
+            if tid == uid():
+                ss.flash = ("error", "You can't delete your own account.")
+            elif (ss.get("mng_del_name", "").strip().lower() != name.lower()):
+                ss.flash = ("error", "Type the username exactly to confirm deletion.")
+            elif row.iloc[0]["role"] == "admin" and bool(row.iloc[0]["active"]) and count_active_admins() <= 1:
+                ss.flash = ("error", "You can't delete the last active admin.")
+            else:
+                for t in OWNED_TABLES:
+                    run(f"DELETE FROM {t} WHERE user_id = %s", (tid,))
+                run("DELETE FROM app_settings WHERE key LIKE %s", (f"{tid}:%",))
+                run("DELETE FROM users WHERE id = %s", (tid,))
+                ss.mng_del_name = ""
+                ss.flash = ("success", f"User “{name}” and all of their data were deleted.")
+
+        with t_users:
+            users_df = query_df("SELECT id, username, role, active, totp_secret, created_at FROM users ORDER BY id")
+            overview = pd.DataFrame({
+                "Username": users_df["username"], "Role": users_df["role"],
+                "Status": users_df["active"].map({True: "🟢 Active", False: "🔴 Disabled"}),
+                "2FA": users_df["totp_secret"].apply(lambda s: "On" if isinstance(s, str) and s else "Off"),
+                "Created": pd.to_datetime(users_df["created_at"]).dt.date})
+            st.caption("Everyone has their own private data. The app never shows one user's shifts, ledger or expenses to another user — admins included. Admins only manage accounts.")
+            show_table(overview, {"Created": st.column_config.DateColumn("Created", format="DD MMM YYYY")})
+
+            st.markdown("#### Add a user")
+            with st.form("add_user_form", clear_on_submit=True):
+                a1, a2 = st.columns(2)
+                nu = a1.text_input("Username (3–30 letters, numbers, . _ -)")
+                npw = a2.text_input("Temporary password (min 8 characters)", type="password")
+                nrole = st.selectbox("Role", ["user", "admin"])
+                if st.form_submit_button("Create user", type="primary"):
+                    nu = nu.strip()
+                    if not USERNAME_RE.match(nu):
+                        st.error("Username must be 3–30 characters: letters, numbers, dot, underscore or dash.")
+                    elif len(npw) < 8:
+                        st.error("The temporary password needs at least 8 characters.")
+                    elif not query_df("SELECT 1 FROM users WHERE LOWER(username) = LOWER(%s)", (nu,)).empty:
+                        st.error("That username is already taken.")
+                    else:
+                        run("INSERT INTO users (username, password_hash, role) VALUES (%s,%s,%s)", (nu, make_password_hash(npw), nrole))
+                        ss.flash = ("success", f"User “{nu}” created. Share the temporary password privately and ask them to change it.")
+                        st.rerun()
+
+            st.markdown("#### Manage a user")
+            ulabels = {int(r.id): f"{r.username} · {r.role}{'' if r.active else ' · disabled'}" for r in users_df.itertuples()}
+            st.selectbox("User", list(ulabels), format_func=ulabels.get, key="mng_user")
+            m1, m2 = st.columns(2, gap="large")
+            with m1:
+                st.text_input("New temporary password", type="password", key="mng_pw")
+                st.button("Reset password", on_click=admin_reset_pw)
+                st.button("Enable / disable account", on_click=admin_toggle_active)
+            with m2:
+                st.button("Switch role (admin ⇄ user)", on_click=admin_set_role)
+                st.button("Remove their 2FA (lost phone)", on_click=admin_remove_2fa)
+            with st.expander("⚠️ Delete this user and ALL of their data"):
+                st.text_input("Type the username to confirm", key="mng_del_name")
+                st.button("Delete user permanently", on_click=admin_delete_user)
