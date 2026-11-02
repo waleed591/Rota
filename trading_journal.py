@@ -5,7 +5,11 @@ Postgres table (trading_journal), scoped to the logged-in user via user_id,
 and uses the same cards, hero and styling helpers as the rest of the app.
 No new dependencies (native Streamlit charts only).
 """
+import calendar
+import html
 import io
+import math
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -24,6 +28,10 @@ SCHEMA = [
           stop_price DOUBLE PRECISION, fees DOUBLE PRECISION, multiplier DOUBLE PRECISION,
           setup TEXT, mood TEXT, rating INTEGER, tags TEXT, notes TEXT)""",
     "CREATE INDEX IF NOT EXISTS trading_journal_user_idx ON trading_journal (user_id)",
+    """CREATE TABLE IF NOT EXISTS trading_journal_shots (
+          id SERIAL PRIMARY KEY, user_id INTEGER, trade_id INTEGER, filename TEXT, mime TEXT,
+          data BYTEA, created_at TIMESTAMP DEFAULT NOW())""",
+    "CREATE INDEX IF NOT EXISTS trading_journal_shots_idx ON trading_journal_shots (user_id, trade_id)",
 ]
 BACKUP_COLS = FIELDS
 
@@ -99,6 +107,209 @@ def breakdown(d, col):
     return out.sort_values("Net P&L", ascending=False)
 
 
+# ---------- screenshots ----------
+MAX_SHOTS = 8          # per trade
+MAX_UPLOAD_MB = 10     # per image, before compression
+IMG_TYPES = ["png", "jpg", "jpeg", "webp"]
+
+
+def md_safe(s):
+    return str(s or "").replace("$", "\\$")
+
+
+def compress_image(data):
+    """Shrink a screenshot to at most 1800px and store it as JPEG. Returns (bytes, mime) or (None, reason)."""
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        im.thumbnail((1800, 1800))
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=85, optimize=True)
+        return out.getvalue(), "image/jpeg"
+    except Exception as e:
+        return None, str(e)
+
+
+def shot_counts(a):
+    df = a.query_df("SELECT trade_id, COUNT(*) AS n FROM trading_journal_shots WHERE user_id = %s GROUP BY trade_id", (a.uid(),))
+    return {int(t): int(n) for t, n in zip(df["trade_id"], df["n"])}
+
+
+def load_shots(a, trade_id):
+    df = a.query_df("SELECT id, filename, data FROM trading_journal_shots WHERE user_id = %s AND trade_id = %s ORDER BY id",
+                    (a.uid(), int(trade_id)))
+    return [{"id": int(r.id), "filename": r.filename or "", "data": bytes(r.data)} for r in df.itertuples()]
+
+
+def save_shots(a, trade_id, files):
+    """Compress and store uploaded images for a trade. Returns (number_saved, list_of_problems)."""
+    import psycopg2
+    have = shot_counts(a).get(int(trade_id), 0)
+    saved, problems = 0, []
+    for f in files or []:
+        if have + saved >= MAX_SHOTS:
+            problems.append(f"Limit of {MAX_SHOTS} screenshots per trade reached.")
+            break
+        raw = f.getvalue()
+        if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
+            problems.append(f"{f.name} is over {MAX_UPLOAD_MB} MB.")
+            continue
+        data, mime = compress_image(raw)
+        if data is None:
+            problems.append(f"{f.name} isn't a readable image.")
+            continue
+        a.run("INSERT INTO trading_journal_shots (user_id, trade_id, filename, mime, data) VALUES (%s,%s,%s,%s,%s)",
+              (a.uid(), int(trade_id), f.name[:120], mime, psycopg2.Binary(data)))
+        saved += 1
+    return saved, problems
+
+
+def _upload_cb(a, trade_id, key):
+    ss = st.session_state
+    saved, problems = save_shots(a, trade_id, ss.get(key))
+    ss.tj_up_ver += 1
+    if problems:
+        ss.flash = ("warning", f"Saved {saved}. " + " ".join(problems))
+    elif saved:
+        ss.flash = ("success", f"Added {saved} screenshot(s).")
+    else:
+        ss.flash = ("info", "Choose at least one image first.")
+
+
+def _delete_shot_cb(a, shot_id):
+    a.run("DELETE FROM trading_journal_shots WHERE id = %s AND user_id = %s", (int(shot_id), a.uid()))
+    st.session_state.flash = ("success", "Screenshot removed.")
+
+
+def show_img(data, caption=None):
+    try:
+        st.image(data, caption=caption, width="stretch")
+    except Exception:                      # older Streamlit versions
+        st.image(data, caption=caption, use_container_width=True)
+
+
+def render_trade(a, r, prefix):
+    """One trade as a card: result, details, notes, screenshots, and a box to add more screenshots."""
+    ss = st.session_state
+    tid = int(r["id"])
+    pnl = float(r["net"])
+    tone = "green" if pnl >= 0 else "red"
+    r_txt = f" · {r['r']:.2f}R" if pd.notna(r["r"]) else ""
+    with st.container(border=True):
+        h1, h2 = st.columns([3, 1])
+        h1.markdown(f"**{r['trade_date']:%a %d %b %Y} · {md_safe(r['symbol'])}** · {r['side']}")
+        h2.markdown(f":{tone}[**{a.gbp(pnl)}**]{r_txt}")
+        stop_txt = f" · stop {r['stop_price']:g}" if r["stop_price"] > 0 else ""
+        st.caption(f"Entry {r['entry_price']:g} → exit {r['exit_price']:g} · qty {r['qty']:g}{stop_txt} · fees {a.gbp(r['fees'])}")
+        meta = [str(x) for x in (r["setup"], r["mood"], f"execution {int(r['rating'])}/5", r["tags"]) if x]
+        st.caption(md_safe(" · ".join(meta)))
+        if r["notes"]:
+            st.markdown(md_safe(r["notes"]))
+        shots = load_shots(a, tid)
+        if shots:
+            cols = st.columns(min(3, len(shots)))
+            for i, s in enumerate(shots):
+                with cols[i % 3]:
+                    show_img(s["data"], s["filename"])
+                    st.button("🗑️ Remove", key=f"{prefix}_rm_{s['id']}", on_click=_delete_shot_cb, args=(a, s["id"]))
+        if len(shots) < MAX_SHOTS:
+            with st.expander("➕ Add screenshots"):
+                key = f"{prefix}_up_{tid}_{ss.tj_up_ver}"
+                st.file_uploader("Images", type=IMG_TYPES, accept_multiple_files=True, key=key, label_visibility="collapsed")
+                st.button("Upload", key=f"{prefix}_ub_{tid}", on_click=_upload_cb, args=(a, tid, key))
+
+
+def render_calendar(a, df, counts):
+    """Month calendar: each day shows its trades, the day's P&L and how many screenshots it has."""
+    c1, c2 = st.columns(2)
+    year = int(c1.number_input("Year", min_value=2020, max_value=2100, value=a.today.year, step=1, key="tj_cal_year"))
+    month = c2.selectbox("Month", list(range(1, 13)), index=a.today.month - 1,
+                         format_func=lambda m: calendar.month_name[m], key="tj_cal_month")
+    sub = df[(df["trade_date"].dt.year == year) & (df["trade_date"].dt.month == month)]
+    by_day = {d: g for d, g in sub.groupby(sub["trade_date"].dt.date)}
+    sign = lambda v: ("+" if v > 0 else "") + a.gbp(v)
+
+    cells = [f'<div class="cal-h">{h}</div>' for h in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]]
+    for week in calendar.monthcalendar(year, month):
+        for dn in week:
+            if dn == 0:
+                cells.append('<div class="cal-d empty"></div>')
+                continue
+            dd = date(year, month, dn)
+            g = by_day.get(dd)
+            style, inner = "", f'<div class="cal-n">{dn}</div>'
+            if g is not None:
+                net = float(g["net"].sum())
+                style = f' style="background:{"rgba(16,185,129,.20)" if net >= 0 else "rgba(239,68,68,.20)"}"'
+                for _, t in g.head(3).iterrows():
+                    v = float(t["net"])
+                    inner += (f'<span class="chip" style="background:{"#10b981" if v >= 0 else "#ef4444"}">'
+                              f'{html.escape(str(t["symbol"]))} {sign(v)}</span>')
+                if len(g) > 3:
+                    inner += f'<div class="cal-t">+{len(g) - 3} more</div>'
+                n_shots = sum(counts.get(int(i), 0) for i in g["id"])
+                inner += f'<div class="cal-t">{sign(net)}' + (f" · 📷 {n_shots}" if n_shots else "") + "</div>"
+            cells.append(f'<div class="cal-d{" today" if dd == a.today else ""}"{style}>{inner}</div>')
+    st.markdown('<div class="cal-wrap"><div class="cal">' + "".join(cells) + "</div></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    if sub.empty:
+        st.info("No trades in this month.")
+        return
+    day_net = sub.groupby(sub["trade_date"].dt.date)["net"].sum()
+    k = st.columns(4)
+    with k[0]: a.card("Month P&L", a.gbp(sub["net"].sum()), f"{len(sub)} trade(s)", "green" if sub["net"].sum() >= 0 else "red")
+    with k[1]: a.card("Green / red days", f"{int((day_net > 0).sum())} / {int((day_net < 0).sum())}", f"{len(day_net)} trading day(s)", "indigo")
+    with k[2]: a.card("Best day", a.gbp(day_net.max()), f"{day_net.idxmax():%a %d %b}", "green")
+    with k[3]: a.card("Worst day", a.gbp(day_net.min()), f"{day_net.idxmin():%a %d %b}", "red")
+
+    days = sorted(by_day)
+    st.subheader("Open a day")
+    pick = st.selectbox("Day", days, index=len(days) - 1, key=f"tj_cal_day_{year}_{month}", label_visibility="collapsed",
+                        format_func=lambda d: f"{d:%a %d %b} · {sign(float(by_day[d]['net'].sum()))} · {len(by_day[d])} trade(s)")
+    for _, r in by_day[pick].iterrows():
+        render_trade(a, r, "cal")
+
+
+def render_history(a, df, counts):
+    """Searchable trade history with screenshots, newest first, paged."""
+    h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
+    q = h1.text_input("Search symbol, setup, tags or notes", key="tj_h_q")
+    only = h2.checkbox("Only with screenshots", key="tj_h_only")
+    order = h3.selectbox("Sort", ["Newest first", "Oldest first", "Best P&L", "Worst P&L"], key="tj_h_sort")
+    per = h4.selectbox("Per page", [5, 10, 20], index=1, key="tj_h_per")
+    v = df.copy()
+    v["shots"] = v["id"].map(counts).fillna(0).astype(int)
+    if q.strip():
+        mask = False
+        for c in ("symbol", "setup", "tags", "notes"):
+            mask = mask | v[c].str.contains(q.strip(), case=False, regex=False)
+        v = v[mask]
+    if only:
+        v = v[v["shots"] > 0]
+    if v.empty:
+        st.info("No trades match your search.")
+        return
+    by = {"Newest first": ("trade_date", False), "Oldest first": ("trade_date", True),
+          "Best P&L": ("net", False), "Worst P&L": ("net", True)}[order]
+    v = v.sort_values([by[0], "id"], ascending=[by[1], by[1]])
+    pages = max(1, math.ceil(len(v) / per))
+    page = 1
+    if pages > 1:
+        page = int(st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key=f"tj_h_page_{pages}_{per}"))
+    st.caption(f"{len(v)} trade(s) · page {page} of {pages}")
+    for _, r in v.iloc[(page - 1) * per: page * per].iterrows():
+        render_trade(a, r, "hist")
+
+
 # ---------- the page ----------
 def render(a):
     """`a` is a namespace of helpers from the main app (uid, run, query_df, hero, card, show_table,
@@ -117,12 +328,17 @@ def render(a):
 
     raw = load_trades(a)
     ss.setdefault("tj_ver", 0)
+    ss.setdefault("tj_up_ver", 0)
+    # clean up screenshots whose trade no longer exists (for example after restoring a backup)
+    a.run("DELETE FROM trading_journal_shots WHERE user_id = %s AND trade_id NOT IN "
+          "(SELECT id FROM trading_journal WHERE user_id = %s)", (a.uid(), a.uid()))
+    counts = shot_counts(a)
 
     # ----- filters (apply to Dashboard and Analytics) -----
     df = pd.DataFrame()
     if not raw.empty:
         full = enrich(raw)
-        with st.expander("🔎 Filters (Dashboard & Analytics)"):
+        with st.expander("🔎 Filters (Dashboard, Calendar, History & Analytics)"):
             lo, hi = full["trade_date"].min().date(), max(a.today, full["trade_date"].max().date())
             rng = st.date_input("Date range", value=(lo, hi), min_value=lo, max_value=hi, key="tj_rng")
             f1, f2, f3, f4 = st.columns(4)
@@ -143,8 +359,8 @@ def render(a):
             df = df[df["side"] == side_f]
         df = df.reset_index(drop=True)
 
-    t_dash, t_log, t_trades, t_an, t_io = st.tabs(
-        ["📊 Dashboard", "➕ Log trade", "🧾 Trades", "🔬 Analytics", "📥 Import & export"])
+    t_dash, t_cal, t_log, t_hist, t_trades, t_an, t_io = st.tabs(
+        ["📊 Dashboard", "📅 Calendar", "➕ Log trade", "🖼️ History", "🧾 Edit trades", "🔬 Analytics", "📥 Import & export"])
 
     # ================= dashboard =================
     with t_dash:
@@ -182,6 +398,24 @@ def render(a):
                 st.bar_chart(pd.DataFrame({"Profit": day.clip(lower=0), "Loss": day.clip(upper=0)}),
                              color=["#10b981", "#ef4444"])
 
+    # ================= calendar =================
+    with t_cal:
+        if raw.empty:
+            st.info("No trades yet. Log your first one in the **Log trade** tab.")
+        elif df.empty:
+            st.warning("No trades match these filters.")
+        else:
+            render_calendar(a, df, counts)
+
+    # ================= history with screenshots =================
+    with t_hist:
+        if raw.empty:
+            st.info("No trades yet. Log your first one in the **Log trade** tab.")
+        elif df.empty:
+            st.warning("No trades match these filters.")
+        else:
+            render_history(a, df, counts)
+
     # ================= log a trade =================
     with t_log:
         defaults = {"tj_side": "Long", "tj_qty": 100.0, "tj_mult": 1.0, "tj_fees": 0.0, "tj_entry": 0.0,
@@ -196,15 +430,19 @@ def render(a):
                 ss.flash = ("error", "Symbol, entry price, exit price and quantity are required.")
                 return
             pnl = calc_net(ss.tj_side, ss.tj_entry, ss.tj_exit, ss.tj_qty, ss.tj_mult, ss.tj_fees)
-            a.run(f"INSERT INTO trading_journal (user_id, {', '.join(FIELDS)}) VALUES (%s, {', '.join(['%s'] * len(FIELDS))})",
+            new = a.query_df(f"INSERT INTO trading_journal (user_id, {', '.join(FIELDS)}) VALUES (%s, {', '.join(['%s'] * len(FIELDS))}) RETURNING id",
                   (a.uid(), ss.tj_date, sym, ss.tj_side, float(ss.tj_entry), float(ss.tj_exit), float(ss.tj_qty),
                    float(ss.tj_stop), float(ss.tj_fees), float(ss.tj_mult), (ss.tj_setup or "").strip(),
                    ss.tj_mood, int(ss.tj_rating), (ss.tj_tags or "").strip(), (ss.tj_notes or "").strip()))
+            saved, problems = save_shots(a, int(new["id"].iloc[0]), ss.get(f"tj_shots_{ss.tj_up_ver}"))
+            ss.tj_up_ver += 1
             for k in ("tj_symbol", "tj_setup", "tj_tags", "tj_notes"):
                 ss[k] = ""
             for k in ("tj_entry", "tj_exit", "tj_stop", "tj_fees"):
                 ss[k] = 0.0
-            ss.flash = ("success", f"Trade saved: {sym} {ss.tj_side.lower()}, P&L {a.gbp(pnl)}.")
+            shots_txt = f" with {saved} screenshot(s)" if saved else ""
+            ss.flash = ("warning" if problems else "success",
+                        f"Trade saved{shots_txt}: {sym} {ss.tj_side.lower()}, P&L {a.gbp(pnl)}." + (" " + " ".join(problems) if problems else ""))
 
         l1, l2 = st.columns(2, gap="large")
         with l1:
@@ -231,6 +469,8 @@ def render(a):
             y2.slider("Execution quality", 1, 5, key="tj_rating", help="How well did you follow your plan, win or lose?")
             st.text_input("Tags (comma separated)", placeholder="earnings, news, london-open", key="tj_tags")
             st.text_area("Notes: what happened, what would you change?", height=120, key="tj_notes")
+            st.file_uploader(f"Screenshots (optional, up to {MAX_SHOTS})", type=IMG_TYPES, accept_multiple_files=True,
+                             key=f"tj_shots_{ss.tj_up_ver}", help="Chart before entry, the exit, your platform's trade summary…")
 
         pnl = calc_net(ss.tj_side, ss.tj_entry, ss.tj_exit, ss.tj_qty, ss.tj_mult, ss.tj_fees)
         risk = abs(ss.tj_entry - ss.tj_stop) * ss.tj_qty * ss.tj_mult if ss.tj_stop > 0 else 0.0
@@ -251,12 +491,13 @@ def render(a):
             view = enrich(raw).sort_values(["trade_date", "id"], ascending=[False, False]).copy()
             view["trade_date"] = view["trade_date"].dt.date
             view.insert(0, "Delete", False)
-            view = view[["Delete", "id"] + FIELDS + ["net"]]
+            view["shots"] = view["id"].map(counts).fillna(0).astype(int)
+            view = view[["Delete", "id"] + FIELDS + ["net", "shots"]]
             extra = sorted(set(view["mood"]) - set(MOODS) - {""})
             st.caption("Edit any cell, tick **Delete** to remove rows, then press **Save changes**. "
                        "This table always shows all of your trades, regardless of the filters.")
             edited = st.data_editor(
-                view, hide_index=True, key=f"tj_editor_{ss.tj_ver}", disabled=["id", "net"],
+                view, hide_index=True, key=f"tj_editor_{ss.tj_ver}", disabled=["id", "net", "shots"],
                 column_config={
                     "Delete": st.column_config.CheckboxColumn("Delete"), "id": None,
                     "trade_date": st.column_config.DateColumn("Date", format="DD MMM YYYY", required=True),
@@ -270,13 +511,15 @@ def render(a):
                     "multiplier": st.column_config.NumberColumn("Mult.", min_value=0.0),
                     "mood": st.column_config.SelectboxColumn("Mood", options=MOODS + extra),
                     "rating": st.column_config.NumberColumn("Quality", min_value=1, max_value=5, step=1),
-                    "net": st.column_config.NumberColumn("Net P&L (£)", format="%.2f")})
+                    "net": st.column_config.NumberColumn("Net P&L (£)", format="%.2f"),
+                    "shots": st.column_config.NumberColumn("📷", format="%d")})
             if st.button("💾 Save changes", type="primary", key="tj_save_edits"):
                 orig = view.set_index("id")
                 n_upd = n_del = n_bad = 0
                 for _, r in edited.iterrows():
                     rid = int(r["id"])
                     if r["Delete"]:
+                        a.run("DELETE FROM trading_journal_shots WHERE trade_id = %s AND user_id = %s", (rid, a.uid()))
                         a.run("DELETE FROM trading_journal WHERE id = %s AND user_id = %s", (rid, a.uid()))
                         n_del += 1
                         continue
@@ -400,6 +643,7 @@ def render(a):
         if not raw.empty:
             def wipe():
                 if ss.get("tj_wipe_ok"):
+                    a.run("DELETE FROM trading_journal_shots WHERE user_id = %s", (a.uid(),))
                     a.run("DELETE FROM trading_journal WHERE user_id = %s", (a.uid(),))
                     ss.tj_wipe_ok = False
                     ss.flash = ("success", "All journal trades deleted.")
